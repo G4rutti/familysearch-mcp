@@ -4,7 +4,8 @@ import { spawn } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
-import { loadConfig, saveConfig, type FamilySearchConfig } from './config.js';
+import { statSync } from 'fs';
+import { configPath, loadConfig, saveConfig, type FamilySearchConfig } from './config.js';
 import {
   extractCookieValue,
   FamilySearchSessionClient,
@@ -35,14 +36,39 @@ const sessionClient = new FamilySearchSessionClient({
   cookies: config.cookies,
 });
 
-const persistConfig = () => saveConfig(config);
+const persistConfig = () => {
+  saveConfig(config);
+  configMtimeMs = configFileMtimeMs();
+};
 
 const server = new McpServer({
   name: 'familysearch',
   version: '2.1.0',
 });
 
+// npm run login writes the session from a separate process, so pick up a
+// newer config file instead of requiring the MCP client to be restarted.
+let configMtimeMs = configFileMtimeMs();
+
+function configFileMtimeMs(): number {
+  try {
+    return statSync(configPath).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function reloadConfigIfChanged(): void {
+  const mtime = configFileMtimeMs();
+  if (mtime && mtime !== configMtimeMs) {
+    configMtimeMs = mtime;
+    config = loadConfig();
+    sessionClient.setSession(config.sessionId, config.fsAnid, config.cookies);
+  }
+}
+
 function isAuthenticated(): boolean {
+  reloadConfigIfChanged();
   return sessionClient.isAuthenticated();
 }
 
