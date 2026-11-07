@@ -7,43 +7,10 @@
  */
 import { chromium } from 'playwright';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { homedir, platform } from 'os';
 import { join } from 'path';
+import { BROWSER_LAUNCH_OPTIONS, configDir, configPath, findBrowserExecutable } from './lib.mjs';
 
-const configDir = join(homedir(), '.familysearch-mcp');
-const configPath = join(configDir, 'config.json');
 const browserProfileDir = join(configDir, 'browser-profile');
-
-const BROWSER_PATHS = {
-  darwin: [
-    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  ],
-  linux: [
-    '/usr/bin/brave-browser',
-    '/usr/bin/brave',
-    '/snap/bin/brave',
-    '/usr/bin/google-chrome',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-  ],
-  win32: [
-    join(process.env.PROGRAMFILES || 'C:\\Program Files', 'BraveSoftware/Brave-Browser/Application/brave.exe'),
-    join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'BraveSoftware/Brave-Browser/Application/brave.exe'),
-    join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google/Chrome/Application/chrome.exe'),
-  ],
-};
-
-function findBrowserExecutable() {
-  const configuredPath = process.env.FAMILYSEARCH_BROWSER_PATH || process.env.BRAVE_PATH;
-  if (configuredPath && existsSync(configuredPath)) {
-    return configuredPath;
-  }
-
-  const candidates = BROWSER_PATHS[platform()] || [];
-  return candidates.find((path) => existsSync(path)) || null;
-}
 
 function loadConfig() {
   if (!existsSync(configPath)) {
@@ -98,7 +65,7 @@ async function main() {
   }
 
   if (!existsSync(browserProfileDir)) {
-    mkdirSync(browserProfileDir, { recursive: true });
+    mkdirSync(browserProfileDir, { recursive: true, mode: 0o700 });
   }
 
   console.error(`Opening browser for FamilySearch login (${browserPath})...`);
@@ -106,10 +73,8 @@ async function main() {
 
   const context = await chromium.launchPersistentContext(browserProfileDir, {
     executablePath: browserPath,
-    headless: false,
     viewport: null,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: ['--disable-blink-features=AutomationControlled'],
+    ...BROWSER_LAUNCH_OPTIONS,
   });
 
   const page = context.pages()[0] || (await context.newPage());

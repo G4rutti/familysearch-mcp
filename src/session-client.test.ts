@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyFullTextMatchMode, FamilySearchSessionClient } from './session-client.js';
+import {
+  applyFullTextMatchMode,
+  assertFamilySearchId,
+  FamilySearchSessionClient,
+  isFamilySearchUrl,
+} from './session-client.js';
 
 test('applyFullTextMatchMode supports OR, AND, and exact phrase searches', () => {
   assert.equal(applyFullTextMatchMode('Ebel Hanses', 'any'), 'Ebel Hanses');
@@ -171,5 +176,199 @@ test('searchCatalog maps DGS searches and catalog metadata', async () => {
     assert.deepEqual(result.entries[0]?.coverage, ['Leeuwarden; 1600-1700']);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+// ---- Combined fork: family shape, record search, security guards ----
+
+function mockFetch(handler: (url: URL, init?: RequestInit) => Response | Promise<Response>) {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: URL; init?: RequestInit }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    calls.push({ url, init });
+    return handler(url, init);
+  }) as typeof fetch;
+  return { calls, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+const fastClient = () =>
+  new FamilySearchSessionClient({ cookies: 'fssessionid=abc; other=1', minIntervalMs: 0, maxRetries: 0 });
+
+test('assertFamilySearchId accepts tree/record IDs and rejects path tricks', () => {
+  for (const id of ['GJZ7-7SH', 'P7CH-Q3T', 'QK1V-3Q9N', 'MXYZ-ABC1']) {
+    assert.equal(assertFamilySearchId(id), id);
+  }
+  for (const bad of ['', '../v8/person', 'GJZ7-7SH/notes', 'GJZ7 7SH', 'a?b=c', 'https://evil.test', 'GJZ7-7SH#x']) {
+    assert.throws(() => assertFamilySearchId(bad), /Invalid FamilySearch/);
+  }
+});
+
+test('isFamilySearchUrl only allows https on familysearch.org and its subdomains', () => {
+  assert.equal(isFamilySearchUrl(new URL('https://www.familysearch.org/x')), true);
+  assert.equal(isFamilySearchUrl(new URL('https://familysearch.org/x')), true);
+  assert.equal(isFamilySearchUrl(new URL('https://sg30p0.familysearch.org/x')), true);
+  assert.equal(isFamilySearchUrl(new URL('http://www.familysearch.org/x')), false);
+  assert.equal(isFamilySearchUrl(new URL('https://familysearch.org.evil.test/x')), false);
+  assert.equal(isFamilySearchUrl(new URL('https://evilfamilysearch.org/x')), false);
+});
+
+test('never sends cookies to a non-FamilySearch URL taken from a response', async () => {
+  const mock = mockFetch((url) => {
+    if (url.pathname.startsWith('/platform/records/personas/')) {
+      return json({
+        persons: [{ id: 'p1', principal: true, names: [{ nameForms: [{ fullText: 'Serafim Diniz' }] }] }],
+        sourceDescriptions: [{ resourceType: 'http://gedcomx.org/Record', about: 'https://evil.test/steal' }],
+      });
+    }
+    throw new Error(`unexpected request to ${url.href}`);
+  });
+  try {
+    const lines = await fastClient().getRecord('QK1V-3Q9N');
+    assert.ok(lines.some((line) => line.includes('Serafim Diniz')));
+    assert.ok(mock.calls.every((call) => call.url.hostname.endsWith('familysearch.org')));
+  } finally {
+    mock.restore();
+  }
+});
+
+test('does not follow a redirect off familysearch.org with the session', async () => {
+  const mock = mockFetch((url) => {
+    if (url.hostname === 'www.familysearch.org') {
+      return new Response(null, { status: 302, headers: { location: 'https://evil.test/collect' } });
+    }
+    throw new Error(`cookies sent to ${url.href}`);
+  });
+  try {
+    await assert.rejects(fastClient().getPersonCard('GJZ7-7SH'), /not following it/);
+    assert.equal(mock.calls.length, 1);
+    assert.equal(mock.calls[0].init?.redirect, 'manual');
+  } finally {
+    mock.restore();
+  }
+});
+
+test('rejects malformed IDs before any request is made', async () => {
+  const mock = mockFetch(() => json({}));
+  try {
+    await assert.rejects(fastClient().getPersonDetails('../../service/x'), /Invalid FamilySearch person ID/);
+    await assert.rejects(fastClient().getRecord('a/b'), /Invalid FamilySearch record ID/);
+    assert.equal(mock.calls.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+const familyMembers = {
+  parents: [
+    {
+      parent1: { id: 'P001-AAA', name: 'Osvaldo José Diniz', lifespan: '1906–1966' },
+      parent2: { id: 'P002-BBB', name: 'Geralda Maria da Silva Diniz', lifespan: '1917–' },
+      children: [{ child: { id: 'P7CH-Q3T', name: 'Celio Diniz' } }, { child: { id: 'P003-CCC', name: 'Jozelia Diniz Moura' } }],
+    },
+  ],
+  spouses: [
+    {
+      parent1: { id: 'P7CH-Q3T', name: 'Celio Diniz' },
+      parent2: { id: 'P7C4-V27', name: 'Marieta Sinfronio Diniz' },
+      children: [{ child: { id: 'GJZ7-81D', name: 'Weber Alexsandro Diniz', lifespan: '1978–' } }],
+      event: { details: { date: { originalText: '1970' }, place: { originalText: 'Barra Mansa' } } },
+    },
+  ],
+};
+
+test('getDescendants reads wrapped children from spouse groups only', async () => {
+  const mock = mockFetch((url) => {
+    if (url.pathname.endsWith('/card')) return json({ name: 'Celio Diniz', lifespan: '1940–' });
+    if (url.pathname.endsWith('/P7CH-Q3T')) return json(familyMembers);
+    return json({});
+  });
+  try {
+    const lines = await fastClient().getDescendants('P7CH-Q3T', 1);
+    assert.ok(lines.some((line) => line.includes('Child: Weber Alexsandro Diniz')));
+    assert.ok(!lines.some((line) => line.includes('Jozelia')), 'siblings must not be listed as descendants');
+  } finally {
+    mock.restore();
+  }
+});
+
+test('getFamily lists parents, siblings, spouse with marriage and children', async () => {
+  const mock = mockFetch(() => json(familyMembers));
+  try {
+    const lines = await fastClient().getFamily('P7CH-Q3T');
+    assert.ok(lines[0].startsWith('Parents: Osvaldo José Diniz'));
+    assert.ok(lines.some((line) => line.includes('Sibling: Jozelia Diniz Moura')));
+    assert.ok(!lines.some((line) => line.includes('Sibling: Celio')));
+    assert.ok(lines.some((line) => line.includes('Spouse: Marieta Sinfronio Diniz') && line.includes('married 1970, Barra Mansa')));
+    assert.ok(lines.some((line) => line.includes('Child: Weber Alexsandro Diniz')));
+  } finally {
+    mock.restore();
+  }
+});
+
+test('searchRecords maps parent/spouse/marriage filters and returns facts, relatives and ark', async () => {
+  const mock = mockFetch(() =>
+    json({
+      results: 3,
+      entries: [
+        {
+          id: 'QK1V-3Q9N',
+          content: {
+            gedcomx: {
+              persons: [
+                { id: 'mother', names: [{ nameForms: [{ fullText: 'Ana Maria da Conceição' }] }] },
+                {
+                  id: 'p1',
+                  principal: true,
+                  gender: { type: 'http://gedcomx.org/Male' },
+                  names: [{ nameForms: [{ fullText: 'Serafim José Diniz' }] }],
+                  facts: [{ type: 'http://gedcomx.org/Marriage', date: { original: '15 Sep 1908' }, place: { original: 'Aiuruoca, Minas Gerais' } }],
+                  sources: [{ description: '#sd1' }],
+                },
+              ],
+              relationships: [
+                { type: 'http://gedcomx.org/Couple', person1: { resource: '#p1' }, person2: { resource: '#mother' } },
+              ],
+              sourceDescriptions: [
+                { id: 'sd1', about: 'https://www.familysearch.org/ark:/61903/1:1:QK1V-3Q9N', collection: { title: 'Brasil, Registros da Igreja Católica' } },
+              ],
+            },
+          },
+        },
+      ],
+    }),
+  );
+  try {
+    const { total, records } = await fastClient().searchRecords({
+      surname: 'Diniz',
+      exactSurname: true,
+      marriageYearFrom: '1905',
+      marriageYearTo: '1910',
+      marriagePlace: 'Aiuruoca',
+      spouseGivenName: 'Ana Maria',
+      fatherSurname: 'Diniz',
+      recordCountry: 'Brazil',
+      limit: 500,
+    });
+    const url = mock.calls[0].url;
+    assert.equal(url.searchParams.get('q.surname.exact'), 'on');
+    assert.equal(url.searchParams.get('q.marriageLikeDate.from'), '1905');
+    assert.equal(url.searchParams.get('q.marriageLikePlace'), 'Aiuruoca');
+    assert.equal(url.searchParams.get('q.spouseGivenName'), 'Ana Maria');
+    assert.equal(url.searchParams.get('q.fatherSurname'), 'Diniz');
+    assert.equal(url.searchParams.get('f.recordCountry'), 'Brazil');
+    assert.equal(url.searchParams.get('count'), '100', 'limit is capped at 100');
+    assert.equal(total, 3);
+    assert.equal(records[0].name, 'Serafim José Diniz');
+    assert.equal(records[0].gender, 'Male');
+    assert.match(records[0].facts, /Marriage: 15 Sep 1908, Aiuruoca/);
+    assert.deepEqual(records[0].relatives, ['Spouse: Ana Maria da Conceição']);
+    assert.equal(records[0].collection, 'Brasil, Registros da Igreja Católica');
+    assert.equal(records[0].ark, 'https://www.familysearch.org/ark:/61903/1:1:QK1V-3Q9N');
+  } finally {
+    mock.restore();
   }
 });

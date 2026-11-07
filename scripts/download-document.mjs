@@ -1,31 +1,14 @@
 #!/usr/bin/env node
 import { chromium } from 'playwright';
-import { existsSync, mkdirSync, readFileSync, statSync } from 'fs';
-import { homedir, platform } from 'os';
-import { basename, extname, join, resolve } from 'path';
-
-const configPath = join(homedir(), '.familysearch-mcp', 'config.json');
-
-const BROWSER_PATHS = {
-  darwin: ['/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'],
-  linux: ['/usr/bin/brave-browser', '/usr/bin/brave', '/snap/bin/brave', '/usr/bin/chromium', '/usr/bin/chromium-browser'],
-  win32: [
-    join(process.env.PROGRAMFILES || 'C:\\Program Files', 'BraveSoftware/Brave-Browser/Application/brave.exe'),
-    join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'BraveSoftware/Brave-Browser/Application/brave.exe'),
-    join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google/Chrome/Application/chrome.exe'),
-  ],
-};
+import { existsSync, mkdirSync, statSync } from 'fs';
+import { basename, extname, join } from 'path';
+import { BROWSER_LAUNCH_OPTIONS, findBrowserExecutable, loadCookies, resolveDownloadDirectory } from './lib.mjs';
 
 const FORMAT_OPTIONS = {
   jpg: { label: 'JPG Only', extension: '.jpg' },
   'pdf-highlights': { label: 'PDF Record Image with Highlights', extension: '.pdf' },
   'pdf-no-highlights': { label: 'PDF Record Image with No Highlights', extension: '.pdf' },
 };
-
-function findBrowserExecutable() {
-  if (process.env.BRAVE_PATH && existsSync(process.env.BRAVE_PATH)) return process.env.BRAVE_PATH;
-  return (BROWSER_PATHS[platform()] || []).find(existsSync) || null;
-}
 
 function parseImageId(value) {
   const match = String(value || '').match(/3:1:[A-Z0-9-]+/i);
@@ -41,27 +24,6 @@ function parseImageLocator(options) {
     throw new Error('Provide imageId, or provide both dgs and a positive imageNumber.');
   }
   return `dgs:${digits.padStart(9, '0')}_${String(imageNumber).padStart(5, '0')}`;
-}
-
-function loadCookies() {
-  if (!existsSync(configPath)) throw new Error('FamilySearch session config not found. Run login-with-browser first.');
-  const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  const cookies = String(config.cookies || '')
-    .split(';')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const separator = part.indexOf('=');
-      return {
-        name: part.slice(0, separator),
-        value: part.slice(separator + 1),
-        domain: '.familysearch.org',
-        path: '/',
-      };
-    })
-    .filter((cookie) => cookie.name && cookie.value);
-  if (!cookies.length) throw new Error('No FamilySearch cookies found. Run login-with-browser first.');
-  return cookies;
 }
 
 function safeFileName(value, imageId, extension) {
@@ -91,16 +53,11 @@ async function main() {
   const executablePath = findBrowserExecutable();
   if (!executablePath) throw new Error('No supported Brave, Chromium, or Chrome browser found.');
 
-  const outputDirectory = resolve(options.outputDirectory || join(homedir(), 'Downloads', 'familysearch-mcp'));
+  const outputDirectory = resolveDownloadDirectory(options.outputDirectory);
   mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
   const outputPath = availablePath(outputDirectory, safeFileName(options.fileName, imageId, format.extension));
 
-  const browser = await chromium.launch({
-    executablePath,
-    headless: false,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
+  const browser = await chromium.launch({ executablePath, ...BROWSER_LAUNCH_OPTIONS });
 
   try {
     const context = await browser.newContext({ viewport: null, acceptDownloads: true });

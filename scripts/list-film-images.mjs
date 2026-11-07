@@ -1,40 +1,6 @@
 #!/usr/bin/env node
 import { chromium } from 'playwright';
-import { existsSync, readFileSync } from 'fs';
-import { homedir, platform } from 'os';
-import { join } from 'path';
-
-const configPath = join(homedir(), '.familysearch-mcp', 'config.json');
-const BROWSER_PATHS = {
-  darwin: [
-    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-  ],
-  linux: ['/usr/bin/brave-browser', '/usr/bin/brave', '/snap/bin/brave', '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser'],
-  win32: [
-    join(process.env.PROGRAMFILES || 'C:\\Program Files', 'BraveSoftware/Brave-Browser/Application/brave.exe'),
-    join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'BraveSoftware/Brave-Browser/Application/brave.exe'),
-    join(process.env.PROGRAMFILES || 'C:\\Program Files', 'Google/Chrome/Application/chrome.exe'),
-  ],
-};
-
-function findBrowserExecutable() {
-  const configuredPath = process.env.FAMILYSEARCH_BROWSER_PATH || process.env.BRAVE_PATH;
-  if (configuredPath && existsSync(configuredPath)) return configuredPath;
-  return (BROWSER_PATHS[platform()] || []).find(existsSync) || null;
-}
-
-function loadCookies() {
-  if (!existsSync(configPath)) throw new Error('FamilySearch session config not found. Run login-with-browser first.');
-  const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  const cookies = String(config.cookies || '').split(';').map((part) => part.trim()).filter(Boolean).map((part) => {
-    const separator = part.indexOf('=');
-    return { name: part.slice(0, separator), value: part.slice(separator + 1), domain: '.familysearch.org', path: '/' };
-  }).filter((cookie) => cookie.name && cookie.value);
-  if (!cookies.length) throw new Error('No FamilySearch cookies found. Run login-with-browser first.');
-  return cookies;
-}
+import { BROWSER_LAUNCH_OPTIONS, findBrowserExecutable, loadCookies } from './lib.mjs';
 
 function normalizeDgs(value) {
   const digits = String(value || '').replace(/\D/g, '');
@@ -54,7 +20,7 @@ async function main() {
   const executablePath = findBrowserExecutable();
   if (!executablePath) throw new Error('No supported Brave, Chrome, or Chromium browser found.');
 
-  const browser = await chromium.launch({ executablePath, headless: false, ignoreDefaultArgs: ['--enable-automation'], args: ['--disable-blink-features=AutomationControlled'] });
+  const browser = await chromium.launch({ executablePath, ...BROWSER_LAUNCH_OPTIONS });
   try {
     const context = await browser.newContext({ viewport: null });
     await context.addCookies(loadCookies());

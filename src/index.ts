@@ -6,11 +6,22 @@ import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { loadConfig, saveConfig, type FamilySearchConfig } from './config.js';
 import {
+  extractCookieValue,
   FamilySearchSessionClient,
   FamilySearchSessionError,
   formatCardBirthDeath,
+  formatMarriage,
   formatPersonSummary,
+  type RecordSearchParams,
 } from './session-client.js';
+
+// Tree person IDs (GJZ7-7SH) and record persona IDs (QK1V-3Q9N). The client
+// re-checks this before building any URL path.
+const familySearchId = (label: string) =>
+  z
+    .string()
+    .regex(/^[A-Za-z0-9]{1,8}(?:-[A-Za-z0-9]{1,8}){0,4}$/, `Expected a FamilySearch ${label} such as GJZ7-7SH`)
+    .describe(label);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const loginScriptPath = join(__dirname, '..', 'scripts', 'browser-login.mjs');
@@ -72,11 +83,6 @@ function transcriptExcerpt(text: string, highlights: string[], maxLength = 700):
   return `${start > 0 ? '…' : ''}${normalized.slice(start, end)}${end < normalized.length ? '…' : ''}`;
 }
 
-function extractCookieValue(cookieHeader: string, name: string): string {
-  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
-  return match?.[1] || '';
-}
-
 function applySessionCookies(cookies: string, sessionId?: string, fsAnid?: string): void {
   config.cookies = cookies.trim();
   config.sessionId = sessionId?.trim() || extractCookieValue(config.cookies, 'fssessionid');
@@ -123,7 +129,7 @@ async function downloadDocument(options: Record<string, unknown>): Promise<Docum
 
 server.tool(
   'set-session-cookie',
-  'Authenticate using browser cookies copied from familysearch.org (DevTools console: copy(document.cookie))',
+  'Authenticate using browser cookies copied from familysearch.org (DevTools console: copy(document.cookie)). Prefer login-with-browser: cookies passed here travel through the AI conversation, while login-with-browser keeps them on this machine.',
   {
     cookies: z
       .string()
@@ -263,8 +269,8 @@ server.tool(
     deathDate: z.string().optional().describe('Death date (YYYY-MM-DD)'),
     deathPlace: z.string().optional().describe('Death place'),
     gender: z.enum(['MALE', 'FEMALE']).optional().describe('Gender'),
-    limit: z.number().optional().describe('Maximum number of results (default: 10)'),
-    offset: z.number().optional().describe('Result offset for pagination (default: 0)'),
+    limit: z.number().int().min(1).max(100).optional().describe('Maximum number of results (default: 10, max: 100)'),
+    offset: z.number().int().min(0).optional().describe('Result offset for pagination (default: 0)'),
   },
   async (params) => {
     if (!isAuthenticated()) {
@@ -297,7 +303,7 @@ server.tool(
   'get-person',
   'Get detailed information about a specific person',
   {
-    personId: z.string().describe('Person ID'),
+    personId: familySearchId('Person ID'),
   },
   async ({ personId }: { personId: string }) => {
     if (!isAuthenticated()) {
@@ -332,7 +338,7 @@ server.tool(
       for (const group of family.spouses || []) {
         const spouse = group.parent1?.id === personId ? group.parent2 : group.parent1;
         if (spouse) {
-          spouseLines.push(`  - ${formatPersonSummary(spouse)}`);
+          spouseLines.push(`  - ${formatPersonSummary(spouse)}${formatMarriage(group)}`);
           for (const { child } of group.children || []) {
             if (child) spouseLines.push(`      child: ${formatPersonSummary(child)}`);
           }
@@ -358,8 +364,8 @@ server.tool(
   'get-ancestors',
   'Get ancestors of a specific person',
   {
-    personId: z.string().describe('Person ID'),
-    generations: z.number().optional().describe('Number of generations (default: 4, max: 8)'),
+    personId: familySearchId('Person ID'),
+    generations: z.number().int().min(1).max(8).optional().describe('Number of generations (default: 4, max: 8)'),
   },
   async ({ personId, generations = 4 }: { personId: string; generations?: number }) => {
     if (!isAuthenticated()) {
@@ -386,8 +392,8 @@ server.tool(
   'get-descendants',
   'Get descendants of a specific person',
   {
-    personId: z.string().describe('Person ID'),
-    generations: z.number().optional().describe('Number of generations (default: 2, max: 3)'),
+    personId: familySearchId('Person ID'),
+    generations: z.number().int().min(1).max(3).optional().describe('Number of generations (default: 2, max: 3)'),
   },
   async ({ personId, generations = 2 }: { personId: string; generations?: number }) => {
     if (!isAuthenticated()) {
@@ -411,43 +417,126 @@ server.tool(
 );
 
 server.tool(
-  'search-records',
-  'Search for historical records in FamilySearch',
+  'get-family',
+  'Get parents, siblings, spouses (with marriage date and place) and children of a person in the Family Tree',
   {
-    givenName: z.string().optional().describe('Given name'),
-    surname: z.string().optional().describe('Surname/last name'),
-    birthDate: z.string().optional().describe('Birth date from (YYYY-MM-DD)'),
-    birthDateTo: z.string().optional().describe('Birth date to (YYYY-MM-DD)'),
-    birthPlace: z.string().optional().describe('Birth place'),
-    deathDate: z.string().optional().describe('Death date from (YYYY-MM-DD)'),
-    deathDateTo: z.string().optional().describe('Death date to (YYYY-MM-DD)'),
-    deathPlace: z.string().optional().describe('Death place'),
-    gender: z.enum(['MALE', 'FEMALE']).optional().describe('Gender'),
-    collectionId: z.string().optional().describe('Specific collection ID to search in'),
-    limit: z.number().optional().describe('Maximum number of results (default: 10)'),
-    offset: z.number().optional().describe('Result offset for pagination (default: 0)'),
+    personId: familySearchId('Person ID'),
   },
-  async (params) => {
+  async ({ personId }: { personId: string }) => {
     if (!isAuthenticated()) {
       return { content: [{ type: 'text', text: authRequiredText() }] };
     }
 
     try {
-      const records = await sessionClient.searchRecords(params);
+      const lines = await sessionClient.getFamily(personId);
+      return { content: [{ type: 'text', text: `Family of ${personId}:\n\n${lines.join('\n')}` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error fetching family: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'get-research-suggestions',
+  "List ancestors (and the root person's children) that have pending record hints (RECORD_HINTS) or FamilySearch research suggestions such as NO_SOURCES_ATTACHED, MISSING_VITAL_EVENT_YEAR or POSSIBLE_CHILD_GAP_AT_END",
+  {
+    personId: familySearchId('Root person ID'),
+    generations: z.number().int().min(1).max(8).optional().describe('Number of ancestor generations (default: 4, max: 8)'),
+  },
+  async ({ personId, generations = 4 }: { personId: string; generations?: number }) => {
+    if (!isAuthenticated()) {
+      return { content: [{ type: 'text', text: authRequiredText() }] };
+    }
+
+    try {
+      const lines = await sessionClient.getResearchSuggestions(personId, generations);
+      const text = lines.length ? lines.join('\n') : 'No record hints or research suggestions found.';
+      return { content: [{ type: 'text', text: `Research suggestions around ${personId}:\n\n${text}` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error fetching research suggestions: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'get-record',
+  'Get a historical record (persona ID from search-records) with its collection, citation, image link, every person on it with their facts and extra fields (age, occupation, residence), and the relationships between them',
+  {
+    recordId: familySearchId('Record persona ID'),
+  },
+  async ({ recordId }: { recordId: string }) => {
+    if (!isAuthenticated()) {
+      return { content: [{ type: 'text', text: authRequiredText() }] };
+    }
+
+    try {
+      const lines = await sessionClient.getRecord(recordId);
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error fetching record: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'search-records',
+  'Search indexed historical records in FamilySearch. Each hit shows its facts with places, the collection, the related persons on the record (spouse, parents, children) and the record link. Years are YYYY; use the *From/*To fields for ranges. Searching by father, mother or spouse names is often the fastest way to confirm a family.',
+  {
+    givenName: z.string().optional().describe('Given name'),
+    surname: z.string().optional().describe('Surname/last name'),
+    exactSurname: z.boolean().optional().describe('Match the surname exactly (no spelling variants)'),
+    gender: z.enum(['MALE', 'FEMALE']).optional().describe('Gender'),
+    birthDate: z.string().optional().describe('Birth date/year as an open-ended lower bound (legacy; prefer birthYearFrom)'),
+    birthYearFrom: z.string().optional().describe('Birth year range start'),
+    birthYearTo: z.string().optional().describe('Birth year range end'),
+    birthPlace: z.string().optional().describe('Birth place'),
+    deathDate: z.string().optional().describe('Death date/year as an open-ended lower bound (legacy; prefer deathYearFrom)'),
+    deathYearFrom: z.string().optional().describe('Death year range start'),
+    deathYearTo: z.string().optional().describe('Death year range end'),
+    deathPlace: z.string().optional().describe('Death place'),
+    marriageYearFrom: z.string().optional().describe('Marriage year range start'),
+    marriageYearTo: z.string().optional().describe('Marriage year range end'),
+    marriagePlace: z.string().optional().describe('Marriage place'),
+    residencePlace: z.string().optional().describe('Residence place'),
+    anyPlace: z.string().optional().describe('Any place in the record'),
+    spouseGivenName: z.string().optional().describe("Spouse's given name"),
+    spouseSurname: z.string().optional().describe("Spouse's surname"),
+    fatherGivenName: z.string().optional().describe("Father's given name"),
+    fatherSurname: z.string().optional().describe("Father's surname"),
+    motherGivenName: z.string().optional().describe("Mother's given name"),
+    motherSurname: z.string().optional().describe("Mother's surname"),
+    recordCountry: z.string().optional().describe('Restrict to records from this country, e.g. Brazil or Italy'),
+    collectionId: z.string().optional().describe('Specific collection ID to search in'),
+    limit: z.number().int().min(1).max(100).optional().describe('Maximum number of results (default: 10, max: 100)'),
+    offset: z.number().int().min(0).optional().describe('Result offset for pagination (default: 0)'),
+  },
+  async (params: RecordSearchParams) => {
+    if (!isAuthenticated()) {
+      return { content: [{ type: 'text', text: authRequiredText() }] };
+    }
+
+    try {
+      const { total, records } = await sessionClient.searchRecords(params);
       if (!records.length) {
         return { content: [{ type: 'text', text: 'No records found matching your search criteria.' }] };
       }
 
       const resultsText = records
-        .map(
-          (record, index) =>
-            `${index + 1}. ${record.name} (${record.id})\n   Gender: ${record.gender}\n   Birth: ${record.birth}\n   Death: ${record.death}\n   Collection: ${record.collection}` +
-            (record.ark ? `\n   Record: ${record.ark}` : ''),
+        .map((record, index) =>
+          [
+            `${(params.offset || 0) + index + 1}. ${record.name} (${record.id}) — ${record.gender}`,
+            `   Collection: ${record.collection}`,
+            record.facts ? `   ${record.facts}` : '',
+            record.relatives.length ? `   ${record.relatives.join('; ')}` : '',
+            record.ark ? `   Record: ${record.ark}` : '',
+          ]
+            .filter(Boolean)
+            .join('\n'),
         )
         .join('\n\n');
 
       return {
-        content: [{ type: 'text', text: `Found ${records.length} matching records:\n\n${resultsText}` }],
+        content: [{ type: 'text', text: `Showing ${records.length} of ${total} records:\n\n${resultsText}` }],
       };
     } catch (error) {
       return { content: [{ type: 'text', text: `Error searching records: ${formatError(error)}` }] };
@@ -588,7 +677,7 @@ server.tool(
     dgs: z.string().regex(/^\d{1,9}$/).optional().describe('DGS/image group number (use together with imageNumber)'),
     imageNumber: z.number().int().min(1).optional().describe('One-based image number within the DGS'),
     format: z.enum(['jpg', 'pdf-highlights', 'pdf-no-highlights']).optional().describe('jpg is the original high-resolution scan (default)'),
-    outputDirectory: z.string().optional().describe('Destination directory (default: ~/Downloads/familysearch-mcp)'),
+    outputDirectory: z.string().optional().describe('Sub-folder inside the download root (default root: ~/Downloads/familysearch-mcp, override with FAMILYSEARCH_DOWNLOAD_DIR); paths outside the root are rejected'),
     fileName: z.string().optional().describe('Optional file name; unsafe path characters are removed and existing files are never overwritten'),
   },
   async (params) => {
