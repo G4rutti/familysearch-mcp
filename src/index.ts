@@ -330,11 +330,11 @@ server.tool(
 
       const spouseLines: string[] = [];
       for (const group of family.spouses || []) {
-        const spouse = group.spouse1?.id === personId ? group.spouse2 : group.spouse1;
+        const spouse = group.parent1?.id === personId ? group.parent2 : group.parent1;
         if (spouse) {
           spouseLines.push(`  - ${formatPersonSummary(spouse)}`);
-          for (const child of group.children || []) {
-            spouseLines.push(`      child: ${formatPersonSummary(child)}`);
+          for (const { child } of group.children || []) {
+            if (child) spouseLines.push(`      child: ${formatPersonSummary(child)}`);
           }
         }
       }

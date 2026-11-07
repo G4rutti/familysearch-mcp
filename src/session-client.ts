@@ -731,14 +731,8 @@ export class FamilySearchSessionClient {
       const children = new Map<string, PersonSummary>();
 
       for (const spouseGroup of family.spouses || []) {
-        for (const child of spouseGroup.children || []) {
-          if (child.id) children.set(child.id, child);
-        }
-      }
-
-      for (const parentGroup of family.parents || []) {
-        for (const child of parentGroup.children || []) {
-          if (child.id && child.id !== currentId) children.set(child.id, child);
+        for (const { child } of spouseGroup.children || []) {
+          if (child?.id) children.set(child.id, child);
         }
       }
 
@@ -917,12 +911,12 @@ export interface FamilyMembersResponse {
   parents?: Array<{
     parent1?: PersonSummary;
     parent2?: PersonSummary;
-    children?: PersonSummary[];
+    children?: Array<{ child?: PersonSummary }>;
   }>;
   spouses?: Array<{
-    spouse1?: PersonSummary;
-    spouse2?: PersonSummary;
-    children?: PersonSummary[];
+    parent1?: PersonSummary;
+    parent2?: PersonSummary;
+    children?: Array<{ child?: PersonSummary }>;
     event?: { details?: { date?: { original?: string }; place?: { localizedText?: string } } };
   }>;
 }
