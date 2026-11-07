@@ -32,28 +32,102 @@ function saveConfig(config) {
   chmodSync(configPath, 0o600);
 }
 
-function readLoggedInUser(page) {
-  return page.evaluate(() => {
-    const userKey = Object.keys(localStorage).find((key) => key.endsWith('-v3-user'));
-    if (!userKey) {
-      return null;
-    }
+const LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
+const POLL_MS = 2000;
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Older FamilySearch builds kept the signed-in user in a localStorage key
+// ending in "-v3-user". Read it when present, but never depend on it.
+async function readUserFromLocalStorage(context) {
+  for (const page of context.pages()) {
     try {
-      const data = JSON.parse(localStorage.getItem(userKey) || '{}');
-      const user = data.user;
-      if (!user?.cisId) {
+      if (!page.url().startsWith('https://www.familysearch.org')) continue;
+      const user = await page.evaluate(() => {
+        for (const key of Object.keys(localStorage)) {
+          if (!/user/i.test(key)) continue;
+          try {
+            const data = JSON.parse(localStorage.getItem(key) || '{}');
+            const user = data.user || data;
+            if (user?.cisId || user?.personId) {
+              return { displayName: user.displayName || user.contactName || '', personId: user.personId || '' };
+            }
+          } catch {
+            // not JSON
+          }
+        }
         return null;
-      }
-
-      return {
-        displayName: user.displayName || user.contactName || 'FamilySearch user',
-        personId: user.personId || '',
-      };
+      });
+      if (user) return user;
     } catch {
-      return null;
+      // page navigating or closed
     }
-  });
+  }
+  return null;
+}
+
+// Ask FamilySearch who the session belongs to. This is the reliable signal:
+// it only succeeds once the login has really finished.
+async function readUserFromApi(context, sessionId) {
+  try {
+    const response = await context.request.get('https://www.familysearch.org/platform/users/current', {
+      headers: { Accept: 'application/x-fs-v1+json', Authorization: `Bearer ${sessionId}` },
+      failOnStatusCode: false,
+    });
+    if (!response.ok()) return null;
+    const data = await response.json();
+    const user = data?.users?.[0];
+    if (!user) return null;
+    return { displayName: user.displayName || user.contactName || '', personId: user.personId || '' };
+  } catch {
+    return null;
+  }
+}
+
+// Same check from inside an open familysearch.org tab, in case bot
+// protection treats the out-of-page request differently from the browser.
+async function readUserFromPage(context, sessionId) {
+  for (const page of context.pages()) {
+    try {
+      if (!page.url().startsWith('https://www.familysearch.org')) continue;
+      const user = await page.evaluate(async (token) => {
+        const response = await fetch('/platform/users/current', {
+          headers: { Accept: 'application/x-fs-v1+json', Authorization: `Bearer ${token}` },
+          credentials: 'include',
+        });
+        if (!response.ok) return null;
+        const data = await response.json();
+        const user = data?.users?.[0];
+        return user ? { displayName: user.displayName || user.contactName || '', personId: user.personId || '' } : null;
+      }, sessionId);
+      if (user) return user;
+    } catch {
+      // page navigating or closed
+    }
+  }
+  return null;
+}
+
+async function waitForLogin(context) {
+  const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+  let lastSession = '';
+  while (Date.now() < deadline) {
+    const cookies = await context.cookies(['https://www.familysearch.org']).catch(() => []);
+    const session = cookies.find((cookie) => cookie.name === 'fssessionid')?.value;
+    if (session) {
+      const user =
+        (await readUserFromApi(context, session)) ||
+        (await readUserFromPage(context, session)) ||
+        (await readUserFromLocalStorage(context));
+      if (user) return { user, cookies, sessionId: session };
+      if (session !== lastSession) {
+        console.error('Session cookie found; waiting for FamilySearch to confirm the login...');
+        lastSession = session;
+      }
+    }
+    await sleep(POLL_MS);
+  }
+  return null;
 }
 
 async function main() {
@@ -80,47 +154,23 @@ async function main() {
   const page = context.pages()[0] || (await context.newPage());
   await page.goto('https://www.familysearch.org/en/');
 
-  try {
-    await page.waitForFunction(
-      () => {
-        const userKey = Object.keys(localStorage).find((key) => key.endsWith('-v3-user'));
-        if (!userKey) {
-          return false;
-        }
-
-        try {
-          const data = JSON.parse(localStorage.getItem(userKey) || '{}');
-          return Boolean(data.user?.cisId);
-        } catch {
-          return false;
-        }
-      },
-      undefined,
-      { timeout: 15 * 60 * 1000 },
-    );
-  } catch {
-    console.error('Timed out waiting for login.');
+  const login = await waitForLogin(context);
+  if (!login) {
+    console.error('Timed out waiting for login. Sign in at familysearch.org in the window that opened, then run npm run login again.');
     await context.close();
     process.exit(1);
   }
 
-  const user = await readLoggedInUser(page);
-  const cookies = await context.cookies(['https://www.familysearch.org']);
+  const { cookies, sessionId } = login;
+  const user = { displayName: login.user.displayName || 'FamilySearch user', personId: login.user.personId };
   const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join('; ');
-  const sessionCookie = cookies.find((cookie) => cookie.name === 'fssessionid');
   const anidCookie = cookies.find((cookie) => cookie.name === 'fs_anid');
-
-  if (!sessionCookie?.value || !user) {
-    console.error('Login was not detected. Make sure you signed in with your FamilySearch account.');
-    await context.close();
-    process.exit(1);
-  }
 
   const existing = loadConfig();
 
   const config = {
     cookies: cookieHeader,
-    sessionId: sessionCookie.value,
+    sessionId,
     fsAnid: anidCookie?.value || existing.fsAnid || '',
     userDisplayName: user.displayName,
     userPersonId: user.personId,
