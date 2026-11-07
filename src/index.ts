@@ -39,7 +39,7 @@ const persistConfig = () => saveConfig(config);
 
 const server = new McpServer({
   name: 'familysearch',
-  version: '2.0.0',
+  version: '2.1.0',
 });
 
 function isAuthenticated(): boolean {

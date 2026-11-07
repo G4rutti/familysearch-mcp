@@ -2,12 +2,29 @@
 
 A local [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server for [FamilySearch](https://www.familysearch.org). Gives AI assistants access to search the Family Tree, view person details, explore ancestors and descendants, and search historical records.
 
+## About this fork
+
+This fork combines the work spread across the forks of
+[JonathanReiss15/familysearch-mcp](https://github.com/JonathanReiss15/familysearch-mcp)
+and adds a security pass on top:
+
+| From | What it brings |
+|---|---|
+| [harrywesterman](https://github.com/harrywesterman/familysearch-mcp/tree/improvement) | Full-text (AI OCR) search, catalog search, film/DGS browsing, high-resolution downloads, rate limiting with cooldown |
+| [twonky4](https://github.com/twonky4/familysearch-mcp/tree/feature/family-records-research-suggestions) | `get-family`, `get-record`, `get-research-suggestions`, record search by father/mother/spouse names and marriage place |
+| [izzybps](https://github.com/izzybps/familysearch-mcp) | Fix for `get-descendants` never returning children |
+| This fork | Same fix applied to `get-person` (spouses and children were always empty), cookies locked to `familysearch.org`, ID validation, downloads confined to one folder, dependencies with 0 known vulnerabilities |
+
+See [AUDIT.md](AUDIT.md) for the full review.
+
 ## Features
 
 - **Family Tree search** — find individuals by name, dates, places, and gender
-- **Person details** — view a person card by ID
+- **Person details** — view a person card by ID, with parents, spouses (and marriage) and children
+- **Family view** — parents, siblings, spouses and children in one call
+- **Research suggestions** — record hints and FamilySearch research flags across your pedigree
 - **Pedigree exploration** — ancestors (up to 8 generations) and descendants (up to 3)
-- **Historical records** — search record collections
+- **Historical records** — search indexed records by the person, their father, mother or spouse, marriage or residence place, and open any record to see everyone on it
 - **AI full-text search** — search OCR transcripts with OR, AND, or exact-phrase matching
 - **Catalog and film browsing** — find catalog items and resolve pages in a DGS image group
 - **High-resolution downloads** — download by ARK image ID or by DGS + image number
@@ -28,7 +45,7 @@ FamilySearch does not approve direct API access for most personal projects. This
 ### 1. Clone and build
 
 ```bash
-git clone https://github.com/JonathanReiss15/familysearch-mcp.git
+git clone https://github.com/G4rutti/familysearch-mcp.git
 cd familysearch-mcp
 npm install
 npm run build
@@ -144,8 +161,6 @@ cwd = "/path/to/familysearch-mcp"
 
 Use `/mcp` in Codex to confirm the server is connected.
 
-This repo also includes `.codex/config.toml` for project-scoped config when the directory is trusted.
-
 ### VS Code
 
 Add to your user MCP config (**Command Palette → `MCP: Open User Configuration`**) or `.vscode/mcp.json` in a workspace:
@@ -193,6 +208,10 @@ Opens Brave when available, otherwise Chrome or Chromium. Set
 
 ### Option 2: Copy cookies manually
 
+> Prefer option 1. Cookies passed to `set-session-cookie` become part of the AI
+> conversation (and so reach the model provider). `npm run login` writes them
+> straight to the local config file.
+
 1. Log in at [familysearch.org](https://www.familysearch.org)
 2. In DevTools → Console, run: `copy(document.cookie)`
 3. Use the `set-session-cookie` MCP tool with the copied string
@@ -209,10 +228,13 @@ The full cookie string is required — bot protection cookies like `reese84` and
 | `set-session-cookie` | Authenticate by pasting cookies from your browser |
 | `get-current-user` | View your authenticated account info |
 | `search-persons` | Search individuals in the Family Tree (name, givenName/surname, dates, places, gender, limit/offset) |
-| `get-person` | Get details for a person by ID, including parents, spouses, children and notes |
+| `get-person` | Get details for a person by ID, including parents, spouses (with marriage), children and notes |
+| `get-family` | Parents, siblings, spouses with marriage date/place, and children of a person |
+| `get-research-suggestions` | Ancestors with pending record hints or research flags such as `NO_SOURCES_ATTACHED` or `MISSING_VITAL_EVENT_YEAR` |
 | `get-ancestors` | View ancestors (default 4 generations, max 8) |
 | `get-descendants` | View descendants (default 2 generations, max 3) |
-| `search-records` | Search historical record collections (date ranges, gender, limit/offset; returns the record `ark` link) |
+| `search-records` | Search indexed records by name, birth/death/marriage year ranges and places, residence, father/mother/spouse names, country, collection; each hit lists its facts, related persons and record link |
+| `get-record` | Open a record (persona ID from `search-records`): collection, citation, image link, every person with facts and extra fields (age, occupation, residence), and their relationships |
 | `search-full-text` | Search FamilySearch AI-OCR transcripts of unindexed scans by keywords, name, place, years, DGS or collection |
 | `search-catalog` | Search the catalog by place, keywords, title, author, subject, surname, call number, film number, or DGS |
 | `list-film-images` | Resolve a range of one-based image numbers in a DGS to permanent `3:1` ARK image IDs |
@@ -234,6 +256,15 @@ Get 4 generations of ancestors for personId G2KQ-JTH
 
 ```
 Search historical records for surname "Reiss" in "Pennsylvania"
+```
+
+```
+Search marriage records in Aiuruoca, Minas Gerais between 1905 and 1910 for a groom
+surnamed Diniz whose bride is named Ana Maria
+```
+
+```
+Show research suggestions for my ancestors, 6 generations up from GJZ7-7SH
 ```
 
 ```
@@ -264,7 +295,9 @@ List 20 images from DGS 008903222, starting at image 500
 Download image 517 from DGS 008903222 as a high-resolution JPG
 ```
 
-Downloads are saved to `~/Downloads/familysearch-mcp` by default. The official
+Downloads are saved to `~/Downloads/familysearch-mcp` by default (set
+`FAMILYSEARCH_DOWNLOAD_DIR` to change it). `outputDirectory` can only name a
+sub-folder inside that root. The official
 FamilySearch viewer opens briefly while preparing the file. JPG downloads use the
 original scan resolution; PDF downloads are available with or without highlights.
 
@@ -336,9 +369,28 @@ To be extra gentle, raise the interval and cooldown, for example:
 ## Security
 
 - Session cookies are stored locally in `~/.familysearch-mcp/config.json`
+  (`chmod 600` on macOS/Linux; on Windows it relies on your user profile's permissions)
 - They grant the same access as your browser session — **never share this file**
 - Sessions expire after inactivity; re-authenticate when tools return auth errors
-- This server runs locally over stdio; no data is sent to third parties
+- The server runs locally over stdio and only ever talks to `https://*.familysearch.org`:
+  any other URL, including one returned by the API or reached through a redirect,
+  is refused before the cookies are attached
+- Person and record IDs are validated before they are put into request paths
+- Downloads can only be written inside the download root
+- All tools are read-only on FamilySearch; nothing edits your tree
+- This is an unofficial client of FamilySearch's internal website endpoints,
+  not its public API. Use it at a human pace (the defaults do this) and be aware
+  it is outside FamilySearch's supported integrations
+
+See [AUDIT.md](AUDIT.md) for details.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FAMILYSEARCH_BROWSER_PATH` | auto-detected | Browser executable for login, film listing and downloads |
+| `FAMILYSEARCH_DOWNLOAD_DIR` | `~/Downloads/familysearch-mcp` | Root folder for downloads |
+| `FAMILYSEARCH_*` rate-limit settings | see [Rate limiting](#rate-limiting) | Request pacing |
 
 ## License
 
