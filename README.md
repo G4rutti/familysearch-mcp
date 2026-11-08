@@ -238,7 +238,7 @@ The full cookie string is required — bot protection cookies like `reese84` and
 | `search-full-text` | Search FamilySearch AI-OCR transcripts of unindexed scans by keywords, name, place, years, DGS or collection |
 | `search-catalog` | Search the catalog by place, keywords, title, author, subject, surname, call number, film number, or DGS |
 | `list-film-images` | Resolve a range of one-based image numbers in a DGS to permanent `3:1` ARK image IDs |
-| `download-document` | Download a scan by ARK image ID or DGS + image number, without overwriting existing files |
+| `download-document` | Fetch a scan by ARK image ID or DGS + image number and return it inline; the file is deleted afterwards unless `keep: true` |
 
 ### Example prompts
 
@@ -295,7 +295,9 @@ List 20 images from DGS 008903222, starting at image 500
 Download image 517 from DGS 008903222 as a high-resolution JPG
 ```
 
-Downloads are saved to `~/Downloads/familysearch-mcp` by default (set
+The image (or PDF) comes back inline in the tool result, and the file is deleted
+from disk right after, so nothing piles up. Pass `keep: true` to keep it.
+Files are written to `~/Downloads/familysearch-mcp` by default (set
 `FAMILYSEARCH_DOWNLOAD_DIR` to change it). `outputDirectory` can only name a
 sub-folder inside that root. The official
 FamilySearch viewer opens briefly while preparing the file. JPG downloads use the

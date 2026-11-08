@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
-import { statSync } from 'fs';
+import { readFileSync, rmSync, statSync } from 'fs';
 import { configPath, loadConfig, saveConfig, type FamilySearchConfig } from './config.js';
 import {
   extractCookieValue,
@@ -28,6 +28,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const loginScriptPath = join(__dirname, '..', 'scripts', 'browser-login.mjs');
 const downloadDocumentScriptPath = join(__dirname, '..', 'scripts', 'download-document.mjs');
 const listFilmImagesScriptPath = join(__dirname, '..', 'scripts', 'list-film-images.mjs');
+// Inline payloads above ~5 MB of base64 are rejected by most MCP clients.
+const MAX_INLINE_BASE64 = 5 * 1024 * 1024;
 
 let config: FamilySearchConfig = loadConfig();
 const sessionClient = new FamilySearchSessionClient({
@@ -697,8 +699,9 @@ server.tool(
 
 server.tool(
   'download-document',
-  'Download a FamilySearch record image as original high-resolution JPG or as a PDF through the official viewer',
+  'Fetch a FamilySearch record image (original high-resolution JPG, or PDF through the official viewer) and return it inline so it can be read. By default the file is deleted from disk right after it is returned; pass keep: true to leave it in the download folder.',
   {
+    keep: z.boolean().optional().describe('Keep the file on disk after returning it (default false: deleted right away)'),
     imageId: z.string().optional().describe('FamilySearch 3:1 image ID or its ARK URL; alternatively use dgs plus imageNumber'),
     dgs: z.string().regex(/^\d{1,9}$/).optional().describe('DGS/image group number (use together with imageNumber)'),
     imageNumber: z.number().int().min(1).optional().describe('One-based image number within the DGS'),
@@ -716,23 +719,36 @@ server.tool(
     if (params.imageId && (params.dgs || params.imageNumber)) {
       return { content: [{ type: 'text', text: 'Use either imageId or dgs + imageNumber, not both.' }] };
     }
+    const { keep, ...downloadOptions } = params;
+    let outputPath: string | undefined;
     try {
-      const result = await downloadDocument(params);
-      return {
-        content: [{
-          type: 'text',
-          text: [
-            'FamilySearch document downloaded.',
-            `Image ID: ${result.imageId}`,
-            `Format: ${result.format}${result.highResolution ? ' (original high resolution)' : ''}`,
-            `Size: ${result.bytes} bytes`,
-            `Saved to: ${result.outputPath}`,
-            `Viewer: ${result.viewerUrl}`,
-          ].join('\n'),
-        }],
-      };
+      const result = await downloadDocument(downloadOptions);
+      outputPath = result.outputPath;
+      const isPdf = result.format.startsWith('pdf');
+      const data = readFileSync(result.outputPath).toString('base64');
+      const tooBig = data.length > MAX_INLINE_BASE64;
+      const lines = [
+        'FamilySearch document fetched.',
+        `Image ID: ${result.imageId}`,
+        `Format: ${result.format}${result.highResolution ? ' (original high resolution)' : ''}`,
+        `Size: ${result.bytes} bytes`,
+        keep ? `Kept on disk at: ${result.outputPath}` : 'Deleted from disk after reading (pass keep: true to keep it).',
+        `Viewer: ${result.viewerUrl}`,
+      ];
+      if (tooBig) lines.push('File is too large to return inline; open it in the viewer instead, or call again with keep: true.');
+      const content: Array<Record<string, unknown>> = [{ type: 'text', text: lines.join('\n') }];
+      if (!tooBig) {
+        content.push(isPdf
+          ? { type: 'resource', resource: { uri: result.viewerUrl, mimeType: 'application/pdf', blob: data } }
+          : { type: 'image', data, mimeType: 'image/jpeg' });
+      }
+      return { content } as { content: never[] };
     } catch (error) {
       return { content: [{ type: 'text', text: `Error downloading document: ${formatError(error)}` }] };
+    } finally {
+      if (outputPath && !keep) {
+        try { rmSync(outputPath, { force: true }); } catch { /* best effort */ }
+      }
     }
   },
 );
