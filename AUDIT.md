@@ -75,6 +75,18 @@ O projeto usa os endpoints internos `/service/` do site, não a API pública. El
 
 O que reduz o risco, e já vinha do fork do Harry: no mínimo ~4 s entre requisições com variação aleatória, nenhuma nova tentativa no erro 15 (bloqueio de segurança) e pausa de 15 min depois de um bloqueio. Todas as ferramentas são **somente leitura** na árvore.
 
+## Atualização: ferramentas de leitura de fontes e duplicatas
+
+Entraram três ferramentas, todas **somente leitura**, então a regra de que nada altera a árvore continua valendo:
+
+- `get-person-sources`: `GET /platform/tree/persons/{id}/sources`.
+- `analyze-merge`: `GET /platform/tree/persons/{sobrevivente}/merges/{duplicata}`. Esse GET só **analisa** a mesclagem; quem executa é o POST no mesmo caminho, e esse POST não existe no código. Teste: *analyzeMerge is a GET dry run*, que confere que nenhuma chamada usa outro método.
+- `find-duplicates`: usa só leituras já existentes (`family-members` e o cartão da pessoa), no máximo 6 cartões por chamada pra respeitar o limite de requisições.
+
+Os IDs passam pela mesma validação (`assertFamilySearchId`) e as chamadas pelo mesmo cliente, com limite de taxa, pausa no erro 15 e cookies travados em `familysearch.org`. Por escolha, **não há** ferramenta de mesclar, anexar fonte ou editar: isso fica no site do FamilySearch, onde há confirmação e desfazer.
+
+Verificação ao vivo (10 de novembro de 2026): os dois endpoints `/platform/` foram chamados só com GET, de dentro de uma sessão logada, com o mesmo `Authorization: Bearer <fssessionid>` que o cliente usa. `/sources` respondeu 200 no formato esperado (15 fontes de um mesmo caso real, com link, citação e nota). `/merges/{a}/{b}` respondeu 200 **somente** com `Accept: application/x-fs-v1+json`; com o tipo GEDCOM X vinha 406, bug que os testes simulados não pegaram e que está corrigido. O que **não** foi exercitado ao vivo foi o código TypeScript em si, que ainda roda só contra `fetch` simulado: a primeira chamada real pela ferramenta é a que confirma de ponta a ponta.
+
 ## O que foi verificado e está ok
 
 - **Rede:** o único destino no código é `www.familysearch.org` e seus subdomínios. Os scripts Playwright só navegam pra páginas do FamilySearch, e os cookies são injetados com `domain: .familysearch.org` e `secure: true`.

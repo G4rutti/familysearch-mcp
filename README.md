@@ -231,6 +231,9 @@ The full cookie string is required — bot protection cookies like `reese84` and
 | `get-person` | Get details for a person by ID, including parents, spouses (with marriage), children and notes |
 | `get-family` | Parents, siblings, spouses with marriage date/place, and children of a person |
 | `get-research-suggestions` | Ancestors with pending record hints or research flags such as `NO_SOURCES_ATTACHED` or `MISSING_VITAL_EVENT_YEAR` |
+| `get-person-sources` | Sources attached to a person (the "Sources" tab): title, link to the original record or archive, citation, notes, date attached. Read-only |
+| `find-duplicates` | Duplicate suspects around a person: look-alike parents when a person has several parent sets, and same-year children of one couple confirmed or ruled out by exact birth date and place. Read-only; suspects, not conclusions |
+| `analyze-merge` | Dry run of merging two persons (survivor + duplicate): both people, what would be copied, conflicting resources, FamilySearch warnings, optional `filter` by category. Read-only; the merge itself is done on familysearch.org |
 | `get-ancestors` | View ancestors (default 4 generations, max 8) |
 | `get-descendants` | View descendants (default 2 generations, max 3) |
 | `search-records` | Search indexed records by name, birth/death/marriage year ranges and places, residence, father/mother/spouse names, country, collection; each hit lists its facts, related persons and record link |
