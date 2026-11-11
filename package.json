@@ -1,6 +1,6 @@
 {
   "name": "familysearch",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "main": "build/index.js",
   "type": "module",
   "scripts": {
@@ -19,6 +19,7 @@
   "description": "FamilySearch MCP server using browser session authentication (combined fork with security hardening)",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "jpeg-js": "^0.4.4",
     "playwright": "^1.51.1",
     "zod": "^4.6.7"
   },

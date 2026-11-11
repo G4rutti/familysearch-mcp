@@ -236,12 +236,19 @@ The full cookie string is required — bot protection cookies like `reese84` and
 | `analyze-merge` | Dry run of merging two persons (survivor + duplicate): both people, what would be copied, conflicting resources, FamilySearch warnings, optional `filter` by category. Read-only; the merge itself is done on familysearch.org |
 | `get-ancestors` | View ancestors (default 4 generations, max 8) |
 | `get-descendants` | View descendants (default 2 generations, max 3) |
-| `search-records` | Search indexed records by name, birth/death/marriage year ranges and places, residence, father/mother/spouse names, country, collection; each hit lists its facts, related persons and record link |
+| `search-records` | Search indexed records by name, birth/death/marriage year ranges and places, residence, father/mother/spouse names, country, collection, or `filmNumber` (only records indexed from one film/DGS: searches inside a set of register books); each hit lists its facts, related persons and record link |
 | `get-record` | Open a record (persona ID from `search-records`): collection, citation, image link, every person with facts and extra fields (age, occupation, residence), and their relationships |
 | `search-full-text` | Search FamilySearch AI-OCR transcripts of unindexed scans by keywords, name, place, years, DGS or collection |
 | `search-catalog` | Search the catalog by place, keywords, title, author, subject, surname, call number, film number, or DGS |
 | `list-film-images` | Resolve a range of one-based image numbers in a DGS to permanent `3:1` ARK image IDs |
 | `download-document` | Fetch a scan by ARK image ID or DGS + image number and return it inline; the file is deleted afterwards unless `keep: true` |
+| `browse-waypoints` | Walk a collection's image folders like the viewer's breadcrumb (collection > place > register book): sub-folders, image count, and image IDs for a range |
+| `get-image-index` | The viewer's "Image Index" tab for one or more consecutive images (max 10): entry/page numbers, event dates, principals with parents (and grandparents when indexed), persona IDs; optional `nameFilter` |
+| `get-image` | A scan or a zoomed-in part of it returned inline (crop given as 0-1 fractions, `maxWidth` cap, never upscaled), with `enhance` for faded ink. No browser needed |
+
+### Reading register books
+
+`search-records` with `filmNumber` finds a name anywhere in a film's index in one call. When the index does not have it, `browse-waypoints` locates the book, `get-image-index` shows what is indexed image by image, and `get-image` crops the handwritten entry for reading. These three use the endpoints of FamilySearch's own image viewer (`/platform/records/waypoints`, `/search/filmdatainfo/image-data` and the deep-zoom `dist.jpg`), so they may change without notice; they go through the same throttle as every other call, about 5 seconds per request.
 
 ### Example prompts
 

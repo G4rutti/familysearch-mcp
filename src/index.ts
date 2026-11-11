@@ -18,6 +18,7 @@ import {
   type MergeAnalysisFilter,
   type RecordSearchParams,
 } from './session-client.js';
+import { formatIndexedRecord, recordMatches } from './image-tools.js';
 
 // Tree person IDs (GJZ7-7SH) and record persona IDs (QK1V-3Q9N). The client
 // re-checks this before building any URL path.
@@ -48,7 +49,7 @@ const persistConfig = () => {
 
 const server = new McpServer({
   name: 'familysearch',
-  version: '2.1.0',
+  version: '2.2.0',
 });
 
 // npm run login writes the session from a separate process, so pick up a
@@ -598,7 +599,7 @@ server.tool(
 
 server.tool(
   'search-records',
-  'Search indexed historical records in FamilySearch. Each hit shows its facts with places, the collection, the related persons on the record (spouse, parents, children) and the record link. Years are YYYY; use the *From/*To fields for ranges. Searching by father, mother or spouse names is often the fastest way to confirm a family.',
+  'Search indexed historical records in FamilySearch. Each hit shows its facts with places, the collection, the related persons on the record (spouse, parents, children) and the record link. Years are YYYY; use the *From/*To fields for ranges. Searching by father, mother or spouse names is often the fastest way to confirm a family. Year filters drop records indexed without a date, so retry without them before concluding a record is absent. filmNumber searches inside one film (set of register books).',
   {
     givenName: z.string().optional().describe('Given name'),
     surname: z.string().optional().describe('Surname/last name'),
@@ -625,6 +626,7 @@ server.tool(
     motherSurname: z.string().optional().describe("Mother's surname"),
     recordCountry: z.string().optional().describe('Restrict to records from this country, e.g. Brazil or Italy'),
     collectionId: z.string().optional().describe('Specific collection ID to search in'),
+    filmNumber: z.string().regex(/^\d{1,9}$/).optional().describe('Only records indexed from this film / image group (DGS number, e.g. 4366075): searches inside one set of register books. Leave out year filters when using it: entries indexed without a date are dropped by them'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum number of results (default: 10, max: 100)'),
     offset: z.number().int().min(0).optional().describe('Result offset for pagination (default: 0)'),
   },
@@ -783,6 +785,122 @@ server.tool(
       return { content: [{ type: 'text', text: `DGS ${result.dgs} contains ${result.total} images; showing ${result.entries.length} from image ${result.startImage}:\nFilm: ${result.filmUrl}\n\n${text}` }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `Error listing film images: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'browse-waypoints',
+  "Browse a collection's image folders (waypoints) the way the image viewer does: place > town > register book. Shows the folder path, its sub-folders, how many images it holds, and optionally the image IDs for a range. Start from a collection ID (e.g. 1582573), then pass a sub-folder URL; the wc= value of any image URL also works. Use the image IDs with get-image-index or get-image.",
+  {
+    waypoint: z.string().describe('Collection ID (e.g. 1582573), a waypoint URL from a previous call, or the wc= value of an image URL (e.g. 9GRZ-FMD:113331301,113331302,113605501)'),
+    collectionId: z.string().regex(/^\d{1,9}$/).optional().describe('Collection ID, only needed with a bare wc= value'),
+    imageStart: z.number().int().min(1).optional().describe('First image number to list (default 1)'),
+    imageLimit: z.number().int().min(0).max(300).optional().describe('How many image IDs to list (default 0: only the count plus first and last image)'),
+  },
+  async ({ waypoint, collectionId, imageStart, imageLimit }: { waypoint: string; collectionId?: string; imageStart?: number; imageLimit?: number }) => {
+    if (!isAuthenticated()) return { content: [{ type: 'text', text: authRequiredText() }] };
+    try {
+      const listing = await sessionClient.browseWaypoint(waypoint, collectionId);
+      const lines = [`Folder: ${listing.path.join(' > ') || listing.title}`, `Waypoint: ${listing.url}`];
+      if (listing.children.length) {
+        lines.push('', `Sub-folders (${listing.children.length}):`);
+        for (const child of listing.children) lines.push(`- ${child.title}\n    ${child.url}`);
+      }
+      if (listing.images.length) {
+        const first = listing.images[0];
+        const last = listing.images[listing.images.length - 1];
+        lines.push('', `Images: ${listing.images.length} (first ${first.imageId}, last ${last.imageId})`);
+        const start = Math.max(1, imageStart || 1);
+        const slice = listing.images.slice(start - 1, start - 1 + (imageLimit || 0));
+        for (const image of slice) lines.push(`${image.imageNumber}. ${image.imageId}`);
+        if (slice.length) lines.push('', 'Pass an image ID (or this waypoint plus imageNumber) to get-image-index or get-image.');
+      }
+      if (!listing.children.length && !listing.images.length) lines.push('', 'This folder has no sub-folders or images.');
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error browsing waypoints: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'get-image-index',
+  "Read the indexed records on one or more consecutive record images (the viewer's \"Image Index\" tab): entry and page numbers, event dates, the principals with their parents (and grandparents when indexed) and persona IDs for get-record. Walks forward with each image's next link, at the API pace (about 5 s per image), so keep count small; to find a name in a whole book, prefer search-records with filmNumber. Many images have no index at all: those come back empty and still need to be read with get-image.",
+  {
+    imageId: z.string().optional().describe('Image ID (3:1:...) or ARK URL of the first image'),
+    waypoint: z.string().optional().describe('Waypoint (see browse-waypoints), used with imageNumber instead of imageId'),
+    imageNumber: z.number().int().min(1).optional().describe('1-based image number inside the waypoint'),
+    count: z.number().int().min(1).max(10).optional().describe('How many consecutive images to read (default 1, max 10)'),
+    nameFilter: z.string().optional().describe('Only show records naming one of these comma-separated fragments (accents/case ignored), e.g. "symphr,sinfr,simphr"'),
+  },
+  async (params: { imageId?: string; waypoint?: string; imageNumber?: number; count?: number; nameFilter?: string }) => {
+    if (!isAuthenticated()) return { content: [{ type: 'text', text: authRequiredText() }] };
+    try {
+      const firstId = await sessionClient.resolveImageId(params);
+      const pages = await sessionClient.getImageIndexRange(firstId, params.count || 1);
+      const lines: string[] = [];
+      let shown = 0;
+      for (const page of pages) {
+        const position = page.imageNumber ? `Image ${page.imageNumber}${page.totalImages ? `/${page.totalImages}` : ''}` : 'Image';
+        if (page.error) {
+          lines.push(`${position} ${page.imageId}: error — ${page.error}`);
+          continue;
+        }
+        const matching = page.records.filter((record) => recordMatches(record, params.nameFilter));
+        const counts = params.nameFilter ? `${matching.length} of ${page.records.length} records match` : `${page.records.length} indexed records`;
+        lines.push(`${position} ${page.imageId}${page.restricted ? ' [restricted]' : ''}: ${page.records.length ? counts : 'no index on this image'}`);
+        for (const record of matching) lines.push(formatIndexedRecord(record));
+        shown += matching.length;
+      }
+      const lastPage = pages[pages.length - 1];
+      const citation = pages.find((page) => page.citation)?.citation;
+      if (citation) lines.push('', `Source: ${citation}`);
+      if (lastPage?.nextImageId) lines.push(`Next image: ${lastPage.nextImageId} (pass as imageId to continue)`);
+      else if (lastPage && !lastPage.error) lines.push('This is the last image of the folder.');
+      if (params.nameFilter && !shown) lines.push(`No record on these images names: ${params.nameFilter}. Unindexed entries are not covered.`);
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error reading the image index: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'get-image',
+  'Return a record image (or a zoomed-in part of it) inline, for reading handwriting. Coordinates are 0-1 fractions of the full scan: x/y is the top-left corner, width/height the size (e.g. x 0.5, width 0.5 is the right-hand page). The output is capped at maxWidth pixels and never upscaled, so crop small to read small writing. enhance: true turns faded ink into high-contrast grayscale. Faster and lighter than download-document.',
+  {
+    imageId: z.string().optional().describe('Image ID (3:1:...) or ARK URL'),
+    waypoint: z.string().optional().describe('Waypoint (see browse-waypoints), used with imageNumber instead of imageId'),
+    imageNumber: z.number().int().min(1).optional().describe('1-based image number inside the waypoint'),
+    x: z.number().min(0).max(1).optional().describe('Left edge, 0-1 (default 0)'),
+    y: z.number().min(0).max(1).optional().describe('Top edge, 0-1 (default 0)'),
+    width: z.number().min(0.01).max(1).optional().describe('Crop width, 0-1 (default: to the right edge)'),
+    height: z.number().min(0.01).max(1).optional().describe('Crop height, 0-1 (default: to the bottom edge)'),
+    maxWidth: z.number().int().min(200).max(3000).optional().describe('Output width cap in pixels (default 1600)'),
+    enhance: z.boolean().optional().describe('Grayscale + auto-contrast for faded ink (default false)'),
+  },
+  async (params: {
+    imageId?: string; waypoint?: string; imageNumber?: number;
+    x?: number; y?: number; width?: number; height?: number; maxWidth?: number; enhance?: boolean;
+  }) => {
+    if (!isAuthenticated()) return { content: [{ type: 'text', text: authRequiredText() }] };
+    try {
+      const imageId = await sessionClient.resolveImageId(params);
+      const result = await sessionClient.getImageCrop(imageId, params);
+      const data = result.jpeg.toString('base64');
+      const { region } = result;
+      const text = [
+        `Image ${result.imageId} (scan ${result.sourceWidth}x${result.sourceHeight} px)`,
+        `Crop: x ${(region.x / result.sourceWidth).toFixed(3)}, y ${(region.y / result.sourceHeight).toFixed(3)}, width ${(region.width / result.sourceWidth).toFixed(3)}, height ${(region.height / result.sourceHeight).toFixed(3)} → ${result.width}x${result.height} px${result.width < region.width ? ` (scaled ${((result.width / region.width) * 100).toFixed(0)}%; crop smaller for full detail)` : ' (full resolution)'}`,
+        `Viewer: https://www.familysearch.org/ark:/61903/${result.imageId}`,
+      ].join('\n');
+      if (data.length > MAX_INLINE_BASE64) {
+        return { content: [{ type: 'text', text: `${text}\nThe crop is too large to return inline; lower maxWidth or crop a smaller area.` }] };
+      }
+      return { content: [{ type: 'text', text }, { type: 'image', data, mimeType: 'image/jpeg' }] } as { content: never[] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error fetching the image: ${formatError(error)}` }] };
     }
   },
 );

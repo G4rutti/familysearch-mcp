@@ -1,3 +1,17 @@
+import {
+  cropJpeg,
+  parseImageData,
+  parseImageId,
+  parseWaypoint,
+  waypointUrl,
+  type CropOptions,
+  type CropResult,
+  type ImageDataResponse,
+  type ImageIndexPage,
+  type WaypointListing,
+  type WaypointResponse,
+} from './image-tools.js';
+
 const BASE_URL = 'https://www.familysearch.org';
 
 // FamilySearch tree person IDs (e.g. GJZ7-7SH) and record persona IDs
@@ -342,6 +356,11 @@ export interface SessionClientOptions {
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36';
 
+interface RequestInitLite {
+  method?: string;
+  body?: string;
+}
+
 const BROWSER_HEADERS: Record<string, string> = {
   Accept: 'application/json',
   'Accept-Language': 'en-US,en;q=0.9',
@@ -536,6 +555,7 @@ export class FamilySearchSessionClient {
     params?: Record<string, string | number | boolean | undefined>,
     extraHeaders: Record<string, string> = {},
     inspect?: (response: Response) => void,
+    init: RequestInitLite = {},
   ): Promise<T> {
     if (!this.cookies) {
       throw new FamilySearchSessionError('Not authenticated. Set a browser session cookie first.');
@@ -566,11 +586,15 @@ export class FamilySearchSessionClient {
       try {
         // Redirects are followed by hand so a 3xx can never carry the cookies
         // to a host outside familysearch.org.
-        response = await this.fetchFamilySearch(url, {
-          ...BROWSER_HEADERS,
-          Cookie: this.cookieHeader(),
-          ...extraHeaders,
-        });
+        response = await this.fetchFamilySearch(
+          url,
+          {
+            ...BROWSER_HEADERS,
+            Cookie: this.cookieHeader(),
+            ...extraHeaders,
+          },
+          init,
+        );
       } catch (error) {
         lastError = error;
         if (attempt < this.maxRetries) {
@@ -647,10 +671,12 @@ export class FamilySearchSessionClient {
       : new FamilySearchSessionError(`Request to ${path} failed after ${this.maxRetries + 1} attempts`);
   }
 
-  private async fetchFamilySearch(url: URL, headers: Record<string, string>): Promise<Response> {
+  private async fetchFamilySearch(url: URL, headers: Record<string, string>, init: RequestInitLite = {}): Promise<Response> {
     let current = url;
     for (let hop = 0; hop <= 5; hop++) {
-      const response = await fetch(current, { headers, redirect: 'manual' });
+      const response = await fetch(current, { headers, redirect: 'manual', method: init.method || 'GET', body: init.body });
+      // Only GETs are re-issued on a redirect; a redirected POST is returned as is.
+      if (init.method && init.method !== 'GET') return response;
       if (response.status < 300 || response.status >= 400) return response;
       const location = response.headers.get('location');
       if (!location) return response;
@@ -1186,10 +1212,152 @@ export class FamilySearchSessionClient {
     if (params.deathDate && !params.deathYearFrom) query['q.deathLikeDate.from'] = params.deathDate;
     if (params.exactSurname) query['q.surname.exact'] = 'on';
     if (params.gender) query['q.sex'] = params.gender === 'MALE' ? 'Male' : 'Female';
+    // Restricts the search to one film / image group (DGS). With
+    // m.queryRequireDefault=on above it is a hard filter, not a ranking hint.
+    if (params.filmNumber) {
+      const digits = String(params.filmNumber).replace(/\D/g, '');
+      if (!digits || digits.length > 9) throw new FamilySearchSessionError('filmNumber must be a DGS/film number of up to 9 digits', 400);
+      query['q.filmNumber'] = digits.padStart(9, '0');
+    }
 
     const data = await this.request<HrPersonasResponse>('/service/search/hr/v2/personas', query);
     const records = extractRecords(data);
     return { total: data.results ?? records.length, records };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Image viewer endpoints: browse folders (waypoints), the per-image index and
+  // crops of the scan. Each call goes through the same throttle as the API.
+
+  private waypointCache = new Map<string, WaypointListing>();
+
+  async browseWaypoint(waypoint: string, collectionId?: string): Promise<WaypointListing> {
+    const url = waypointUrl(waypoint, collectionId);
+    const cached = this.waypointCache.get(url);
+    if (cached) return cached;
+    const data = await this.platformRequest<WaypointResponse>(url);
+    const listing = parseWaypoint(url, data);
+    this.waypointCache.set(url, listing);
+    return listing;
+  }
+
+  /** imageId wins; otherwise the image at imageNumber (1-based) inside a waypoint. */
+  async resolveImageId(locator: { imageId?: string; waypoint?: string; imageNumber?: number }): Promise<string> {
+    if (locator.imageId) return parseImageId(locator.imageId);
+    if (!locator.waypoint || !locator.imageNumber) {
+      throw new FamilySearchSessionError('Provide imageId, or waypoint plus imageNumber.', 400);
+    }
+    const listing = await this.browseWaypoint(locator.waypoint);
+    const image = listing.images[locator.imageNumber - 1];
+    if (!image) {
+      throw new FamilySearchSessionError(`"${listing.title}" has ${listing.images.length} images; there is no image ${locator.imageNumber}.`, 400);
+    }
+    return image.imageId;
+  }
+
+  /** The viewer's own call: citation, prev/next and every indexed record on one image. */
+  async getImageIndexPage(imageId: string): Promise<ImageIndexPage> {
+    imageId = parseImageId(imageId);
+    const imageURL = `${BASE_URL}/ark:/61903/${imageId}`;
+    const data = await this.request<ImageDataResponse>(
+      '/search/filmdatainfo/image-data',
+      undefined,
+      { 'Content-Type': 'application/json', Referer: imageURL },
+      undefined,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'image-data',
+          args: { imageURL, locale: 'en', state: { imageOrFilmUrl: '', selectedImageIndex: -1, viewMode: 'i' } },
+        }),
+      },
+    );
+    return parseImageData(imageId, data);
+  }
+
+  /** Walks `count` images forward from imageId using each image's next link. */
+  async getImageIndexRange(imageId: string, count: number): Promise<ImageIndexPage[]> {
+    const pages: ImageIndexPage[] = [];
+    let current: string | undefined = parseImageId(imageId);
+    for (let i = 0; i < count && current; i++) {
+      const thisImage: string = current;
+      try {
+        const page = await this.getImageIndexPage(thisImage);
+        pages.push(page);
+        current = page.nextImageId;
+      } catch (error) {
+        pages.push({ imageId: thisImage, records: [], error: error instanceof Error ? error.message : String(error) });
+        // Without the response there is no next link to follow.
+        break;
+      }
+    }
+    return pages;
+  }
+
+  /** Downloads the full-resolution scan and returns a cropped, scaled JPEG. */
+  async getImageCrop(imageId: string, options: CropOptions): Promise<CropResult & { imageId: string }> {
+    imageId = parseImageId(imageId);
+    const original = await this.requestBinary(`/service/records/storage/deepzoomcloud/dz/v1/${imageId}/dist.jpg`);
+    return { ...cropJpeg(original, options), imageId };
+  }
+
+  private async requestBinary(path: string): Promise<Buffer> {
+    if (!this.cookies) {
+      throw new FamilySearchSessionError('Not authenticated. Set a browser session cookie first.');
+    }
+    const cooldown = this.cooldownError();
+    if (cooldown) throw cooldown;
+
+    const url = new URL(path.startsWith('http') ? path : `${BASE_URL}${path}`);
+    if (!isFamilySearchUrl(url)) {
+      throw new FamilySearchSessionError(`Refusing to send the FamilySearch session to ${url.origin} (only https://*.familysearch.org)`);
+    }
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      await this.throttle();
+      let response: Response;
+      try {
+        response = await this.fetchFamilySearch(url, {
+          ...BROWSER_HEADERS,
+          Accept: 'image/avif,image/webp,image/jpeg,image/*;q=0.8,*/*;q=0.5',
+          'Sec-Fetch-Dest': 'image',
+          'Sec-Fetch-Mode': 'no-cors',
+          Cookie: this.cookieHeader(),
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt < this.maxRetries) {
+          await sleep(this.backoffMs(attempt));
+          continue;
+        }
+        throw new FamilySearchSessionError(
+          `Network error contacting ${url.pathname}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      if (response.ok && contentType.startsWith('image/')) {
+        return Buffer.from(await response.arrayBuffer());
+      }
+      const text = await response.text().catch(() => '');
+      if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
+        lastError = new FamilySearchSessionError(`HTTP ${response.status}`, response.status);
+        await this.pauseForRetry(response, attempt, `HTTP ${response.status}`);
+        continue;
+      }
+      if (response.status === 401 || response.status === 403) {
+        throw new FamilySearchSessionError(
+          `FamilySearch refused the image (HTTP ${response.status}). It may be a restricted image, or the session expired (re-run login-with-browser).`,
+          response.status,
+        );
+      }
+      throw new FamilySearchSessionError(
+        `Image request failed (HTTP ${response.status}, ${contentType || 'no content type'}): ${text.slice(0, 200)}`,
+        response.status,
+      );
+    }
+    throw lastError instanceof Error ? lastError : new FamilySearchSessionError(`Image request to ${url.pathname} failed`);
   }
 
   async searchFullText(params: {
@@ -1550,13 +1718,14 @@ export interface RecordSearchParams {
   motherSurname?: string;
   recordCountry?: string;
   collectionId?: string;
+  filmNumber?: string;
   limit?: number;
   offset?: number;
 }
 
 type StringSearchParam = Exclude<
   keyof RecordSearchParams,
-  'exactSurname' | 'gender' | 'birthDate' | 'deathDate' | 'limit' | 'offset'
+  'exactSurname' | 'gender' | 'birthDate' | 'deathDate' | 'filmNumber' | 'limit' | 'offset'
 >;
 
 const RECORD_SEARCH_PARAMS: ReadonlyArray<[StringSearchParam, string]> = [
