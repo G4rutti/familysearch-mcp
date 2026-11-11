@@ -1,5 +1,6 @@
 import {
   cropJpeg,
+  isBotChallengePage,
   parseImageData,
   parseImageId,
   parseWaypoint,
@@ -399,6 +400,8 @@ const DEFAULT_JITTER_FACTOR = envFloat('FAMILYSEARCH_JITTER_FACTOR', 0.5);
 const DEFAULT_BACKOFF_BASE_MS = envInt('FAMILYSEARCH_BACKOFF_MS', 3000);
 const DEFAULT_BACKOFF_MAX_MS = envInt('FAMILYSEARCH_BACKOFF_MAX_MS', 60_000);
 const DEFAULT_COOLDOWN_MS = envInt('FAMILYSEARCH_COOLDOWN_MS', 15 * 60_000);
+// Full-resolution scans are several MB each, so they get a wider spacing than API calls.
+const DEFAULT_IMAGE_INTERVAL_MS = envInt('FAMILYSEARCH_IMAGE_INTERVAL_MS', 8000);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -436,6 +439,7 @@ export class FamilySearchSessionClient {
   private backoffMaxMs: number;
   private cooldownMs: number;
   private lastRequestAt = 0;
+  private lastBinaryAt = 0;
   private throttleQueue: Promise<void> = Promise.resolve();
   private cooldownUntil = 0;
   private cooldownReason = '';
@@ -1315,7 +1319,10 @@ export class FamilySearchSessionClient {
 
     let lastError: unknown;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      const imageWait = DEFAULT_IMAGE_INTERVAL_MS - (Date.now() - this.lastBinaryAt);
+      if (imageWait > 0) await sleep(imageWait);
       await this.throttle();
+      this.lastBinaryAt = Date.now();
       let response: Response;
       try {
         response = await this.fetchFamilySearch(url, {
@@ -1341,6 +1348,15 @@ export class FamilySearchSessionClient {
         return Buffer.from(await response.arrayBuffer());
       }
       const text = await response.text().catch(() => '');
+      // The bot filter answers with an HTML interstitial (often HTTP 200). Retrying
+      // only prolongs the block, so stop everything for a while.
+      if (isBotChallengePage(contentType, text)) {
+        this.enterCooldown(this.cooldownMs, 'bot-protection page ("Pardon Our Interruption")');
+        throw new FamilySearchSessionError(
+          'FamilySearch showed its bot-protection page instead of the image. Pausing all requests to avoid a longer block. Open familysearch.org in your browser, solve the check if one appears, then retry later.',
+          response.status,
+        );
+      }
       if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
         lastError = new FamilySearchSessionError(`HTTP ${response.status}`, response.status);
         await this.pauseForRetry(response, attempt, `HTTP ${response.status}`);

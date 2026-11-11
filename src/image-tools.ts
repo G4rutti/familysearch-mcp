@@ -389,3 +389,9 @@ export function cropJpeg(input: Buffer | Uint8Array, options: CropOptions = {}):
     region: { x: x0, y: y0, width: rw, height: rh },
   };
 }
+
+/** True when a response body is FamilySearch's bot-protection interstitial rather than the requested file. */
+export function isBotChallengePage(contentType: string, body: string): boolean {
+  if (!contentType.toLowerCase().includes('text/html')) return false;
+  return /Pardon Our Interruption|Request unsuccessful\. Incapsula|_Incapsula_Resource/i.test(body);
+}

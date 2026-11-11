@@ -4,6 +4,7 @@ import jpeg from 'jpeg-js';
 import {
   cropJpeg,
   formatIndexedRecord,
+  isBotChallengePage,
   parseImageData,
   parseImageId,
   parseWaypoint,
@@ -111,4 +112,11 @@ test('cropJpeg crops by fractions, never upscales and caps the width', () => {
 
   const enhanced = cropJpeg(source, { enhance: true });
   assert.equal(enhanced.sourceWidth, 400);
+});
+
+test('isBotChallengePage only flags the HTML interstitial', () => {
+  const page = '<noscript><title>Pardon Our Interruption</title></noscript>';
+  assert.equal(isBotChallengePage('text/html; charset=UTF-8', page), true);
+  assert.equal(isBotChallengePage('image/jpeg', page), false);
+  assert.equal(isBotChallengePage('text/html', '<html>HTTP 404</html>'), false);
 });
