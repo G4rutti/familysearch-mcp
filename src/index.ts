@@ -12,7 +12,10 @@ import {
   FamilySearchSessionError,
   formatCardBirthDeath,
   formatMarriage,
+  formatMergeAnalysis,
+  formatPersonSources,
   formatPersonSummary,
+  type MergeAnalysisFilter,
   type RecordSearchParams,
 } from './session-client.js';
 
@@ -482,6 +485,93 @@ server.tool(
       return { content: [{ type: 'text', text: `Research suggestions around ${personId}:\n\n${text}` }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `Error fetching research suggestions: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'get-person-sources',
+  'List the sources attached to a Family Tree person (the "Sources" tab): title, link to the original record or archive, citation, notes and when it was attached. Read-only.',
+  {
+    personId: familySearchId('Person ID'),
+  },
+  async ({ personId }: { personId: string }) => {
+    if (!isAuthenticated()) {
+      return { content: [{ type: 'text', text: authRequiredText() }] };
+    }
+
+    try {
+      const sources = await sessionClient.getPersonSources(personId);
+      return { content: [{ type: 'text', text: `Sources of ${personId}:\n${formatPersonSources(sources).join('\n')}` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error fetching sources: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'analyze-merge',
+  'Dry-run analysis of merging two Family Tree persons: shows both people, what would be copied from the duplicate, which resources conflict, and any FamilySearch warning (e.g. "must switch order"). Read-only: it never performs the merge. Merging itself must be done on familysearch.org.',
+  {
+    survivorId: familySearchId('Survivor person ID (the one that is kept)'),
+    duplicateId: familySearchId('Duplicate person ID (the one that is merged into the survivor)'),
+    filter: z
+      .enum([
+        'CoupleRelationships',
+        'NonVitalConclusions',
+        'ParentChildRelationshipsAsChild',
+        'ParentChildRelationshipsAsParent',
+        'SourceReferences',
+        'VitalConclusions',
+      ])
+      .optional()
+      .describe('Only analyse one category of data'),
+  },
+  async ({
+    survivorId,
+    duplicateId,
+    filter,
+  }: {
+    survivorId: string;
+    duplicateId: string;
+    filter?: MergeAnalysisFilter;
+  }) => {
+    if (!isAuthenticated()) {
+      return { content: [{ type: 'text', text: authRequiredText() }] };
+    }
+
+    try {
+      const result = await sessionClient.analyzeMerge(survivorId, duplicateId, filter);
+      return { content: [{ type: 'text', text: formatMergeAnalysis(result, filter).join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error analysing merge: ${formatError(error)}` }] };
+    }
+  },
+);
+
+server.tool(
+  'find-duplicates',
+  'Look for likely duplicate persons around a person, using the family structure: parents that look alike when a person is linked to several parent sets, and children of the same couple born the same year (confirmed or ruled out by exact birth date and place). Read-only; results are suspects to verify with analyze-merge, not conclusions.',
+  {
+    personId: familySearchId('Person ID whose parents, siblings and children are checked'),
+  },
+  async ({ personId }: { personId: string }) => {
+    if (!isAuthenticated()) {
+      return { content: [{ type: 'text', text: authRequiredText() }] };
+    }
+
+    try {
+      const { findings, unchecked } = await sessionClient.findDuplicates(personId);
+      if (!findings.length && !unchecked) {
+        return { content: [{ type: 'text', text: `No duplicate suspects found around ${personId}.` }] };
+      }
+      const lines = findings.map(
+        (finding) => `- [${finding.strength}] ${finding.summary} (analyze-merge: ${finding.ids[0]} / ${finding.ids[1]})`,
+      );
+      if (unchecked) lines.push(`- ${unchecked} more same-year pair(s) not checked to protect the rate limit; run again on a child or sibling.`);
+      return { content: [{ type: 'text', text: `Duplicate suspects around ${personId}:\n\n${lines.join('\n')}` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `Error looking for duplicates: ${formatError(error)}` }] };
     }
   },
 );

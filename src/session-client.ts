@@ -101,6 +101,64 @@ interface SourceDescription {
   collection?: { title?: string };
   resourceType?: string;
   citations?: Array<{ value?: string }>;
+  notes?: Array<{ text?: string }>;
+}
+
+// GEDCOM X "source reference" as returned by /platform/tree/persons/{id}/sources.
+interface PlatformSourceReference {
+  description?: string;
+  descriptionId?: string;
+  attribution?: { modified?: number; changeMessage?: string };
+}
+
+interface PlatformSourcesResponse {
+  persons?: Array<{ id?: string; sources?: PlatformSourceReference[] }>;
+  sourceDescriptions?: SourceDescription[];
+}
+
+export interface PersonSource {
+  id: string;
+  title: string;
+  citation: string;
+  url: string;
+  notes: string[];
+  attachedOn: string;
+  changeMessage: string;
+}
+
+export type MergeAnalysisFilter =
+  | 'CoupleRelationships'
+  | 'NonVitalConclusions'
+  | 'ParentChildRelationshipsAsChild'
+  | 'ParentChildRelationshipsAsParent'
+  | 'SourceReferences'
+  | 'VitalConclusions';
+
+interface MergeResourceRef {
+  resource?: string;
+}
+
+interface MergeAnalysisResponse {
+  mergeAnalyses?: Array<{
+    survivorResources?: MergeResourceRef[];
+    duplicateResources?: MergeResourceRef[];
+    conflictingResources?: Array<{ survivorResource?: MergeResourceRef; duplicateResource?: MergeResourceRef }>;
+  }>;
+}
+
+export interface MergeAnalysisResult {
+  survivor: PersonCard;
+  duplicate: PersonCard;
+  warning: string;
+  survivorOnly: string[];
+  duplicateOnly: string[];
+  conflicts: Array<{ survivor: string; duplicate: string }>;
+}
+
+export interface DuplicateFinding {
+  strength: 'strong' | 'possible';
+  ids: [string, string];
+  summary: string;
 }
 
 interface GedcomxRecord {
@@ -449,20 +507,35 @@ export class FamilySearchSessionClient {
     await sleep(retryAfter ?? this.backoffMs(attempt));
   }
 
-  private async platformRequest<T>(path: string): Promise<T> {
+  // Most /platform/ resources answer GEDCOM X; the merge resource only answers
+  // the FamilySearch media type and returns 406 for the other one.
+  private async platformRequest<T>(
+    path: string,
+    params?: Record<string, string | number | boolean | undefined>,
+    inspect?: (response: Response) => void,
+    accept = 'application/x-gedcomx-v1+json',
+  ): Promise<T> {
     if (!this.sessionId) {
       throw new FamilySearchSessionError('No fssessionid in session cookies. Re-run login-with-browser.', 401);
     }
-    return this.request<T>(path, undefined, {
-      Accept: 'application/x-gedcomx-v1+json',
-      Authorization: `Bearer ${this.sessionId}`,
-    });
+    return this.request<T>(
+      path,
+      params,
+      {
+        Accept: accept,
+        Authorization: `Bearer ${this.sessionId}`,
+      },
+      inspect,
+    );
   }
 
+  // `inspect` sees every raw response (status, headers) before it is parsed or
+  // turned into an error, e.g. to read the Warning header of a merge analysis.
   private async request<T>(
     path: string,
     params?: Record<string, string | number | boolean | undefined>,
     extraHeaders: Record<string, string> = {},
+    inspect?: (response: Response) => void,
   ): Promise<T> {
     if (!this.cookies) {
       throw new FamilySearchSessionError('Not authenticated. Set a browser session cookie first.');
@@ -509,6 +582,7 @@ export class FamilySearchSessionClient {
         );
       }
 
+      inspect?.(response);
       const text = await response.text();
       let data: unknown;
       const contentType = response.headers.get('content-type') || '';
@@ -845,6 +919,160 @@ export class FamilySearchSessionClient {
     return lines;
   }
 
+  // Read-only: the sources attached to a Family Tree person (the "Sources" tab),
+  // including user-created ones whose `about` points to an external archive.
+  async getPersonSources(personId: string): Promise<PersonSource[]> {
+    personId = assertFamilySearchId(personId, 'person ID');
+    const data = await this.platformRequest<PlatformSourcesResponse | string>(`/platform/tree/persons/${personId}/sources`);
+    // 204 (no sources) comes back as an empty body.
+    if (!data || typeof data !== 'object') return [];
+
+    const descriptions = new Map((data.sourceDescriptions || []).map((sd) => [sd.id || '', sd] as const));
+    const person = data.persons?.find((p) => p.id === personId) || data.persons?.[0];
+    const refs = person?.sources || [];
+
+    const toSource = (id: string, description?: SourceDescription, ref?: PlatformSourceReference): PersonSource => ({
+      id,
+      title: description?.titles?.[0]?.value || 'Untitled source',
+      citation: (description?.citations?.[0]?.value || '').replace(/<[^>]+>/g, '').trim(),
+      url: description?.about || '',
+      notes: (description?.notes || []).map((note) => note.text || '').filter(Boolean),
+      attachedOn: ref?.attribution?.modified ? new Date(ref.attribution.modified).toISOString().slice(0, 10) : '',
+      changeMessage: ref?.attribution?.changeMessage || '',
+    });
+
+    if (!refs.length) {
+      return [...descriptions].map(([id, description]) => toSource(id, description));
+    }
+    return refs.map((ref) => {
+      const id = ref.descriptionId || ref.description?.split(/[#/]/).pop() || '';
+      return toSource(id, descriptions.get(id), ref);
+    });
+  }
+
+  // Read-only dry run: GET on the merge resource only analyses the merge, it
+  // never performs it. Lists what would be copied from each side and which
+  // resources conflict. A `Warning` header (e.g. 450 "must switch order") is returned as-is.
+  async analyzeMerge(
+    survivorId: string,
+    duplicateId: string,
+    filter?: MergeAnalysisFilter,
+  ): Promise<MergeAnalysisResult> {
+    survivorId = assertFamilySearchId(survivorId, 'survivor person ID');
+    duplicateId = assertFamilySearchId(duplicateId, 'duplicate person ID');
+    if (survivorId === duplicateId) {
+      throw new FamilySearchSessionError('Survivor and duplicate must be different people.', 400);
+    }
+
+    let warning = '';
+    const data = await this.platformRequest<MergeAnalysisResponse | string>(
+      `/platform/tree/persons/${survivorId}/merges/${duplicateId}`,
+      filter ? { filter } : undefined,
+      (response) => {
+        warning = response.headers.get('warning') || '';
+      },
+      'application/x-fs-v1+json',
+    );
+    const analysis = data && typeof data === 'object' ? data.mergeAnalyses?.[0] : undefined;
+
+    const [survivor, duplicate] = await Promise.all([this.getPersonCard(survivorId), this.getPersonCard(duplicateId)]);
+    return {
+      survivor: { ...survivor, id: survivor.id || survivorId },
+      duplicate: { ...duplicate, id: duplicate.id || duplicateId },
+      warning,
+      survivorOnly: (analysis?.survivorResources || []).map(mergeResourceLabel),
+      duplicateOnly: (analysis?.duplicateResources || []).map(mergeResourceLabel),
+      conflicts: (analysis?.conflictingResources || []).map((pair) => ({
+        survivor: mergeResourceLabel(pair.survivorResource),
+        duplicate: mergeResourceLabel(pair.duplicateResource),
+      })),
+    };
+  }
+
+  // Read-only. The platform /matches endpoint answers 204 for every person (see
+  // getResearchSuggestions), so duplicates are found from the family structure:
+  //  1. a person linked to several sets of parents, where the parents look alike;
+  //  2. children of one couple born in the same year, confirmed or ruled out by
+  //     comparing exact birth date and place on their person cards.
+  async findDuplicates(
+    personId: string,
+    maxCardChecks = 6,
+  ): Promise<{ findings: DuplicateFinding[]; unchecked: number }> {
+    personId = assertFamilySearchId(personId, 'person ID');
+    const family = await this.getFamilyMembers(personId);
+    const findings: DuplicateFinding[] = [];
+    const seen = new Set<string>();
+    const pairKey = (a: string, b: string) => [a, b].sort().join('|');
+
+    const parentGroups = family.parents || [];
+    if (parentGroups.length > 1) {
+      const parents: PersonSummary[] = [];
+      for (const group of parentGroups) {
+        for (const parent of [group.parent1, group.parent2]) {
+          if (parent?.id && !parents.some((known) => known.id === parent.id)) parents.push(parent);
+        }
+      }
+      for (let i = 0; i < parents.length; i++) {
+        for (let j = i + 1; j < parents.length; j++) {
+          const a = parents[i];
+          const b = parents[j];
+          if (!a.id || !b.id || !looksLikeSameParent(a, b)) continue;
+          seen.add(pairKey(a.id, b.id));
+          const sameGiven = firstGivenName(a.name) === firstGivenName(b.name);
+          findings.push({
+            strength: 'possible',
+            ids: [a.id, b.id],
+            summary:
+              `${formatSummary(a)} and ${formatSummary(b)}: both appear as parents of ${personId} ` +
+              `(${parentGroups.length} parent sets), similar surname and birth year, ` +
+              `${sameGiven ? 'same given name' : 'different given name (could be a brother or a wrong link)'}`,
+          });
+        }
+      }
+    }
+
+    const candidates: Array<[PersonSummary, PersonSummary]> = [];
+    for (const group of [...parentGroups, ...(family.spouses || [])]) {
+      const children = (group.children || [])
+        .map((entry) => entry.child)
+        .filter((child): child is PersonSummary => Boolean(child?.id));
+      for (let i = 0; i < children.length; i++) {
+        for (let j = i + 1; j < children.length; j++) {
+          const a = children[i];
+          const b = children[j];
+          const year = birthYear(a);
+          if (!year || year !== birthYear(b)) continue;
+          if (a.gender && b.gender && a.gender.toUpperCase() !== b.gender.toUpperCase()) continue;
+          const key = pairKey(a.id!, b.id!);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          candidates.push([a, b]);
+        }
+      }
+    }
+
+    for (const [a, b] of candidates.slice(0, maxCardChecks)) {
+      const [cardA, cardB] = await Promise.all([this.getPersonCard(a.id!), this.getPersonCard(b.id!)]);
+      const birthA = formatCardEvent(cardA.birth);
+      const birthB = formatCardEvent(cardB.birth);
+      if (birthA.date && birthB.date && birthA.date.toLowerCase() !== birthB.date.toLowerCase()) continue;
+
+      const sameDate = Boolean(birthA.date && birthB.date);
+      const samePlace = Boolean(birthA.place && birthB.place && birthA.place.toLowerCase() === birthB.place.toLowerCase());
+      findings.push({
+        strength: sameDate ? 'strong' : 'possible',
+        ids: [a.id!, b.id!],
+        summary:
+          `${formatSummary(a)} and ${formatSummary(b)}: same parents, ` +
+          (sameDate
+            ? `same birth date (${birthA.date})${samePlace ? ` and place (${birthA.place})` : ''}`
+            : `same birth year, exact date missing on one side (could be twins)`),
+      });
+    }
+
+    return { findings, unchecked: Math.max(0, candidates.length - maxCardChecks) };
+  }
+
   async getAncestors(personId: string, generations = 4) {
     personId = assertFamilySearchId(personId, 'person ID');
     const gens = Math.min(Math.max(generations, 1), 8);
@@ -1136,6 +1364,104 @@ export function formatMarriage(group: FamilyGroup): string {
   const place = group.event?.details?.place?.originalText || group.event?.details?.place?.normalizedText;
   if (!date && !place) return '';
   return ` — married ${[date, place].filter(Boolean).join(', ')}`;
+}
+
+// "…/persons/P12-345/conclusions/ABCD" -> "conclusions/ABCD"
+function mergeResourceLabel(ref?: MergeResourceRef): string {
+  return (ref?.resource || '').split('/').filter(Boolean).slice(-2).join('/') || '?';
+}
+
+function birthYear(person: PersonSummary): string {
+  return person.birth?.date?.match(/\d{4}/)?.[0] || person.lifespan?.match(/^\s*(\d{4})/)?.[1] || '';
+}
+
+// Lower-case, no accents or punctuation, doubled letters collapsed
+// (Garutti/Garuti, Carmellina/Carmelina) so spelling variants compare equal.
+export function normalizeName(name?: string): string {
+  return (name || '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ')
+    .replace(/(.)\1+/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function firstGivenName(name?: string): string {
+  return normalizeName(name).split(' ')[0] || '';
+}
+
+function levenshtein(a: string, b: string): number {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let previous = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const current = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] === b[j - 1] ? 0 : 1));
+      previous = current;
+    }
+  }
+  return row[b.length];
+}
+
+export function surnamesAlike(a?: string, b?: string): boolean {
+  const lastA = normalizeName(a).split(' ').pop() || '';
+  const lastB = normalizeName(b).split(' ').pop() || '';
+  if (!lastA || !lastB) return false;
+  if (lastA === lastB || levenshtein(lastA, lastB) <= 1) return true;
+  const [shorter, longer] = lastA.length <= lastB.length ? [lastA, lastB] : [lastB, lastA];
+  return shorter.length >= 4 && longer.startsWith(shorter);
+}
+
+// Two people linked as parents of the same child: they can both be right only
+// if they differ in gender, so same-gender look-alikes are duplicate suspects.
+export function looksLikeSameParent(a: PersonSummary, b: PersonSummary): boolean {
+  if (a.gender && b.gender && a.gender.toUpperCase() !== b.gender.toUpperCase()) return false;
+  if (!surnamesAlike(a.name, b.name)) return false;
+  const yearA = birthYear(a);
+  const yearB = birthYear(b);
+  return !yearA || !yearB || Math.abs(Number(yearA) - Number(yearB)) <= 10;
+}
+
+export function formatPersonSources(sources: PersonSource[]): string[] {
+  if (!sources.length) return ['No sources attached.'];
+  const lines: string[] = [`${sources.length} source${sources.length === 1 ? '' : 's'}:`];
+  sources.forEach((source, index) => {
+    lines.push('', `${index + 1}. ${source.title}${source.attachedOn ? ` (attached ${source.attachedOn})` : ''}`);
+    if (source.url) lines.push(`   Link: ${source.url}`);
+    if (source.citation) lines.push(`   Citation: ${source.citation}`);
+    for (const note of source.notes) lines.push(`   Note: ${note.replace(/\s+/g, ' ').trim()}`);
+    if (source.changeMessage) lines.push(`   Reason: ${source.changeMessage}`);
+  });
+  return lines;
+}
+
+export function formatMergeAnalysis(result: MergeAnalysisResult, filter?: MergeAnalysisFilter): string[] {
+  const describe = (card: PersonCard) => {
+    const { birth, death } = formatCardBirthDeath(card);
+    return `${card.name || 'Unknown'} [${card.id}] — b. ${birth}; d. ${death}`;
+  };
+  const lines = [
+    `Merge analysis (dry run, nothing was changed)${filter ? ` — filter: ${filter}` : ''}`,
+    `Survivor:  ${describe(result.survivor)}`,
+    `Duplicate: ${describe(result.duplicate)}`,
+  ];
+  if (result.warning) lines.push(`Warning from FamilySearch: ${result.warning}`);
+  lines.push(
+    '',
+    `Resources only on the survivor: ${result.survivorOnly.length}`,
+    `Resources only on the duplicate (would be copied): ${result.duplicateOnly.length}`,
+    `Conflicting pairs (one side must be chosen): ${result.conflicts.length}`,
+  );
+  for (const conflict of result.conflicts) {
+    lines.push(`  - survivor ${conflict.survivor}  vs  duplicate ${conflict.duplicate}`);
+  }
+  if (!filter) {
+    lines.push('', 'Tip: call again with a filter (VitalConclusions, SourceReferences, CoupleRelationships, …) to see one category at a time.');
+  }
+  return lines;
 }
 
 function personName(person: GedcomxPerson): string {

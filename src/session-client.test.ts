@@ -4,7 +4,11 @@ import {
   applyFullTextMatchMode,
   assertFamilySearchId,
   FamilySearchSessionClient,
+  formatMergeAnalysis,
+  formatPersonSources,
   isFamilySearchUrl,
+  normalizeName,
+  surnamesAlike,
 } from './session-client.js';
 
 test('applyFullTextMatchMode supports OR, AND, and exact phrase searches', () => {
@@ -368,6 +372,244 @@ test('searchRecords maps parent/spouse/marriage filters and returns facts, relat
     assert.deepEqual(records[0].relatives, ['Spouse: Ana Maria da Conceição']);
     assert.equal(records[0].collection, 'Brasil, Registros da Igreja Católica');
     assert.equal(records[0].ark, 'https://www.familysearch.org/ark:/61903/1:1:QK1V-3Q9N');
+  } finally {
+    mock.restore();
+  }
+});
+
+// ---- Read-only duplicate / merge / source tools ----
+
+const isReadOnly = (calls: Array<{ init?: RequestInit }>) =>
+  calls.every((call) => !call.init?.method || call.init.method === 'GET');
+
+test('getPersonSources resolves each reference to its description and keeps the original link', async () => {
+  const mock = mockFetch((url) => {
+    assert.equal(url.pathname, '/platform/tree/persons/G8BH-KNV/sources');
+    return json({
+      persons: [
+        {
+          id: 'G8BH-KNV',
+          sources: [
+            {
+              description: 'https://api.familysearch.org/platform/sources/descriptions/SD-1',
+              descriptionId: 'SD-1',
+              attribution: { modified: Date.UTC(2025, 11, 16), changeMessage: 'Imigração' },
+            },
+            { description: '#SD-2' },
+          ],
+        },
+      ],
+      sourceDescriptions: [
+        {
+          id: 'SD-1',
+          about: 'http://imagem.sian.an.gov.br/acervo/derivadas/doc.pdf',
+          titles: [{ value: 'Imigração ao Brasil – Vapor Roma (1888)' }],
+          citations: [{ value: '<i>HRJ</i> 228/257' }],
+          notes: [{ text: 'Veio ao Brasil, aos 42 anos, casado' }],
+        },
+        { id: 'SD-2', titles: [{ value: 'Registro civil de Modena' }] },
+      ],
+    });
+  });
+  try {
+    const sources = await fastClient().getPersonSources('G8BH-KNV');
+    assert.equal(sources.length, 2);
+    assert.equal(sources[0].title, 'Imigração ao Brasil – Vapor Roma (1888)');
+    assert.equal(sources[0].url, 'http://imagem.sian.an.gov.br/acervo/derivadas/doc.pdf');
+    assert.equal(sources[0].citation, 'HRJ 228/257');
+    assert.equal(sources[0].attachedOn, '2025-12-16');
+    assert.deepEqual(sources[0].notes, ['Veio ao Brasil, aos 42 anos, casado']);
+    assert.equal(sources[1].title, 'Registro civil de Modena');
+
+    const text = formatPersonSources(sources).join('\n');
+    assert.match(text, /2 sources:/);
+    assert.match(text, /Link: http:\/\/imagem\.sian\.an\.gov\.br/);
+    assert.equal((mock.calls[0].init?.headers as Record<string, string>).Authorization, 'Bearer abc');
+    assert.ok(isReadOnly(mock.calls));
+  } finally {
+    mock.restore();
+  }
+});
+
+test('getPersonSources treats an empty 204 answer as no sources and validates the ID', async () => {
+  const mock = mockFetch(() => new Response(null, { status: 204 }));
+  try {
+    const sources = await fastClient().getPersonSources('P7CC-25G');
+    assert.deepEqual(sources, []);
+    assert.deepEqual(formatPersonSources(sources), ['No sources attached.']);
+    await assert.rejects(fastClient().getPersonSources('../x'), /Invalid FamilySearch person ID/);
+    assert.equal(mock.calls.length, 1);
+  } finally {
+    mock.restore();
+  }
+});
+
+const mergeCards: Record<string, unknown> = {
+  'G494-RV6': {
+    name: 'Carmellina Anna Maria Garuti',
+    birth: { details: { date: { localizedText: '17 August 1876' }, place: { localizedText: 'Soliera, Modena, Italy' } } },
+  },
+  'PMJX-JLH': {
+    name: 'Crimilina Garut',
+    birth: { details: { date: { localizedText: '17 August 1876' }, place: { localizedText: 'Soliera, Modena, Italy' } } },
+  },
+};
+
+test('analyzeMerge is a GET dry run that reports the warning, copies and conflicts', async () => {
+  const mock = mockFetch((url) => {
+    if (url.pathname === '/platform/tree/persons/G494-RV6/merges/PMJX-JLH') {
+      return new Response(
+        JSON.stringify({
+          mergeAnalyses: [
+            {
+              survivorResources: [{ resource: 'https://api.familysearch.org/platform/tree/persons/G494-RV6/conclusions/AAAA' }],
+              duplicateResources: [
+                { resource: 'https://api.familysearch.org/platform/tree/persons/PMJX-JLH/conclusions/BBBB' },
+                { resource: 'https://api.familysearch.org/platform/tree/persons/PMJX-JLH/source-references/CCCC' },
+              ],
+              conflictingResources: [
+                {
+                  survivorResource: { resource: 'https://api.familysearch.org/platform/tree/persons/G494-RV6/conclusions/NAME1' },
+                  duplicateResource: { resource: 'https://api.familysearch.org/platform/tree/persons/PMJX-JLH/conclusions/NAME2' },
+                },
+              ],
+            },
+          ],
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json', warning: '450 FamilySearch "Can merge, but must switch order"' },
+        },
+      );
+    }
+    const id = url.pathname.split('/').at(-2) || '';
+    return json(mergeCards[id] || {});
+  });
+  try {
+    const result = await fastClient().analyzeMerge('G494-RV6', 'PMJX-JLH', 'VitalConclusions');
+    assert.equal(mock.calls[0].url.searchParams.get('filter'), 'VitalConclusions');
+    assert.ok(isReadOnly(mock.calls), 'analysis must never POST');
+    // Found against the live API: the merge resource answers 406 to the GEDCOM X media type.
+    assert.equal((mock.calls[0].init?.headers as Record<string, string>).Accept, 'application/x-fs-v1+json');
+    assert.match(result.warning, /must switch order/);
+    assert.deepEqual(result.survivorOnly, ['conclusions/AAAA']);
+    assert.deepEqual(result.duplicateOnly, ['conclusions/BBBB', 'source-references/CCCC']);
+    assert.deepEqual(result.conflicts, [{ survivor: 'conclusions/NAME1', duplicate: 'conclusions/NAME2' }]);
+
+    const text = formatMergeAnalysis(result, 'VitalConclusions').join('\n');
+    assert.match(text, /dry run, nothing was changed/);
+    assert.match(text, /Survivor:\s+Carmellina Anna Maria Garuti \[G494-RV6\]/);
+    assert.match(text, /Duplicate: Crimilina Garut \[PMJX-JLH\]/);
+    assert.match(text, /Warning from FamilySearch/);
+    assert.match(text, /Conflicting pairs \(one side must be chosen\): 1/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('analyzeMerge refuses the same person twice and bad IDs before any request', async () => {
+  const mock = mockFetch(() => json({}));
+  try {
+    await assert.rejects(fastClient().analyzeMerge('G494-RV6', 'G494-RV6'), /must be different/);
+    await assert.rejects(fastClient().analyzeMerge('G494-RV6', '../x'), /Invalid FamilySearch duplicate person ID/);
+    assert.equal(mock.calls.length, 0);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('name helpers treat spelling variants as alike', () => {
+  assert.equal(normalizeName('Garutti'), normalizeName('Garuti'));
+  assert.equal(normalizeName('Carmellina Anna'), 'carmelina ana');
+  assert.equal(surnamesAlike('Costantino Garuti', 'Constante Garutti'), true);
+  assert.equal(surnamesAlike('Crimilina Garut', 'Carmellina Garuti'), true);
+  assert.equal(surnamesAlike('Diomira di Antonio Cantarelli', 'Diomira Cantarelli'), true);
+  assert.equal(surnamesAlike('Costantino Garuti', 'Diomira Cantarelli'), false);
+});
+
+// Mirrors the real mess around the Garuti family: the child is linked to three
+// parent sets, and two daughters share one birth date.
+const duplicateFamily = {
+  parents: [
+    {
+      parent1: { id: 'G8BH-KNV', name: 'Costantino Garuti', gender: 'MALE', lifespan: '1845–' },
+      parent2: { id: 'GQKW-XJX', name: 'Diomira Cantarelli', gender: 'FEMALE', lifespan: '1850–' },
+      children: [
+        { child: { id: 'G494-RV6', name: 'Carmellina Anna Maria Garuti', gender: 'FEMALE', lifespan: '1876–' } },
+        { child: { id: 'PMJX-JLH', name: 'Crimilina Garut', gender: 'FEMALE', lifespan: '1876–' } },
+        { child: { id: 'GQKW-KXZ', name: 'Angelo Giuseppe Maria Garuti', gender: 'MALE', lifespan: '1877–' } },
+      ],
+    },
+    {
+      parent1: { id: 'PFBM-B76', name: 'Constante Garutti', gender: 'MALE', lifespan: '1846–' },
+      parent2: { id: 'PFB9-2LS', name: 'Diomira di Antonio Cantarelli', gender: 'FEMALE', lifespan: '1859–' },
+      children: [{ child: { id: 'G494-RV6', name: 'Carmellina Anna Maria Garuti', gender: 'FEMALE', lifespan: '1876–' } }],
+    },
+    {
+      parent1: { id: 'G494-PNQ', name: 'Nicolo Garuti', gender: 'MALE', lifespan: '1843–' },
+      children: [{ child: { id: 'G494-RV6', name: 'Carmellina Anna Maria Garuti', gender: 'FEMALE', lifespan: '1876–' } }],
+    },
+  ],
+  spouses: [],
+};
+
+test('findDuplicates flags look-alike parents and confirms same-date siblings from the cards', async () => {
+  const mock = mockFetch((url) => {
+    if (url.pathname.includes('/family-members/')) return json(duplicateFamily);
+    if (url.pathname.endsWith('/card')) return json(mergeCards[url.pathname.split('/').at(-2) || ''] || {});
+    throw new Error(`unexpected request to ${url.href}`);
+  });
+  try {
+    const { findings, unchecked } = await fastClient().findDuplicates('G494-RV6');
+    assert.equal(unchecked, 0);
+    assert.ok(isReadOnly(mock.calls));
+
+    const strong = findings.filter((finding) => finding.strength === 'strong');
+    assert.equal(strong.length, 1);
+    assert.deepEqual([...strong[0].ids].sort(), ['G494-RV6', 'PMJX-JLH']);
+    assert.match(strong[0].summary, /same birth date \(17 August 1876\) and place \(Soliera, Modena, Italy\)/);
+
+    const possible = findings.filter((finding) => finding.strength === 'possible');
+    const pair = (a: string, b: string) =>
+      possible.find((finding) => [...finding.ids].sort().join() === [a, b].sort().join());
+    assert.match(pair('G8BH-KNV', 'PFBM-B76')?.summary || '', /different given name/);
+    assert.match(pair('G8BH-KNV', 'G494-PNQ')?.summary || '', /different given name/);
+    assert.match(pair('GQKW-XJX', 'PFB9-2LS')?.summary || '', /same given name/);
+    assert.equal(pair('G8BH-KNV', 'GQKW-XJX'), undefined, 'a father and a mother are not duplicates');
+    assert.equal(possible.length, 4);
+  } finally {
+    mock.restore();
+  }
+});
+
+test('findDuplicates drops same-year siblings whose exact birth dates differ and honours the card cap', async () => {
+  const family = {
+    parents: [
+      {
+        parent1: { id: 'P001-AAA', name: 'Pai Teste', gender: 'MALE', lifespan: '1840–' },
+        children: [
+          { child: { id: 'C001-AAA', name: 'Gêmea Um', gender: 'FEMALE', lifespan: '1880–' } },
+          { child: { id: 'C002-BBB', name: 'Gêmea Dois', gender: 'FEMALE', lifespan: '1880–' } },
+        ],
+      },
+    ],
+  };
+  const cards: Record<string, unknown> = {
+    'C001-AAA': { name: 'Gêmea Um', birth: { details: { date: { localizedText: '2 March 1880' } } } },
+    'C002-BBB': { name: 'Gêmea Dois', birth: { details: { date: { localizedText: '9 November 1880' } } } },
+  };
+  const mock = mockFetch((url) => {
+    if (url.pathname.includes('/family-members/')) return json(family);
+    return json(cards[url.pathname.split('/').at(-2) || ''] || {});
+  });
+  try {
+    const checked = await fastClient().findDuplicates('C001-AAA');
+    assert.deepEqual(checked.findings, []);
+    assert.equal(checked.unchecked, 0);
+
+    const capped = await fastClient().findDuplicates('C001-AAA', 0);
+    assert.deepEqual(capped.findings, []);
+    assert.equal(capped.unchecked, 1);
   } finally {
     mock.restore();
   }
